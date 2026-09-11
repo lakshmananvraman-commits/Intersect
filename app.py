@@ -100,7 +100,16 @@ def run_model(p, mwac, pv_bos, ppa=None, life=None, rec=None, mod=None, mh=None,
             tax[i] = (max(ti, 0.0) - used) * p['tax_rate']
             nol = nol - used + max(-ti, 0.0)
     itc_cash = itc * (transfer if tax_mode.startswith("ITC transfer") else 1.0)
-    itc_flow = np.zeros(n); itc_flow[0] = itc_cash
+    itc_flow = np.zeros(n)
+    if tax_mode.startswith("ITC carried forward"):
+        # A tax credit can only offset tax actually owed, so it waits in a bank
+        # until the project has a liability. No cash arrives in Year 1.
+        bank = itc
+        for i in range(n):
+            use = min(tax[i], bank); bank -= use; tax[i] -= use
+        itc_cash = itc - bank                      # portion ever used
+    else:
+        itc_flow[0] = itc_cash
     atcf = ebitda - tax + itc_flow
 
     pre = np.concatenate(([-capex], ebitda)); aft = np.concatenate(([-capex], atcf))
@@ -113,11 +122,16 @@ def run_model(p, mwac, pv_bos, ppa=None, life=None, rec=None, mod=None, mh=None,
 
 
 def solve_ppa(p, mwac, pv_bos, target, **kw):
+    """Bisection on PPA price. Returns np.nan if the target is unreachable
+    within the search range (e.g. target IRR above anything the project can pay)."""
     lo, hi = 0.0, 400.0
+    top = run_model(p, mwac, pv_bos, ppa=hi, **kw)['irr_at']
+    if not np.isfinite(top) or top < target:
+        return np.nan
     for _ in range(60):
         mid = (lo + hi) / 2
         v = run_model(p, mwac, pv_bos, ppa=mid, **kw)['irr_at']
-        if np.isnan(v) or v < target: lo = mid
+        if not np.isfinite(v) or v < target: lo = mid
         else: hi = mid
     return (lo + hi) / 2
 
@@ -161,10 +175,15 @@ with st.sidebar:
         ptax_esc = st.number_input("Property tax escalation (%/yr)", 0.0, 6.0, 2.0, 0.25) / 100
     with st.expander("Tax & finance", expanded=True):
         tax_mode = st.radio("Tax structure",
-                            ["ITC transfer + NOL carryforward (primary)", "NOL carryforward (conservative)", "Immediate monetisation"],
-                            help="Primary: ITC sold to a third party under IRA §6418 at a discount; depreciation losses stay with the project. "
-                                 "NOL: project uses the full ITC itself and carries losses forward (floor). Immediate: a sponsor with taxable "
-                                 "income absorbs every loss as cash (ceiling).")
+                            ["ITC transfer + NOL carryforward (primary)",
+                             "NOL carryforward, ITC used in full Yr 1",
+                             "Immediate monetisation",
+                             "ITC carried forward + NOL (no outside taxpayer)"],
+                            help="PRIMARY: credit sold to a third party under IRA §6418 at a discount; depreciation losses stay with the "
+                                 "project. NOL/ITC-in-full: books the whole credit in Year 1 while paying no tax for 17 years — flattering "
+                                 "but internally inconsistent. IMMEDIATE: a sponsor with other taxable income absorbs every loss as cash "
+                                 "(upper bound). CARRIED FORWARD: the consistent version of going it alone — the credit waits until the "
+                                 "project actually owes tax.")
         transfer = st.slider("ITC transfer price (¢ per $1 of credit)", 80, 100, 93, 1,
                              disabled=not tax_mode.startswith("ITC transfer")) / 100
         itc_rate = st.number_input("ITC rate (%)", 0.0, 60.0, 30.0, 1.0) / 100
@@ -187,6 +206,9 @@ P = dict(ppa=ppa, ppa_term=ppa_term, ppa_esc=ppa_esc, life=life, yld=yld, degr=d
          merch_haircut=merch_haircut, price_mode=price_mode, post_esc=post_esc,
          merchant=MERCHANT_DEFAULT, depr=DEPR_DEFAULT)
 
+# NOTE: Streamlit executes this script top-to-bottom in a single pass. An exception
+# inside any `with tab_x:` block aborts the whole run, so every tab defined LATER in
+# the file also fails to render. Keep each block defensive.
 tab_sum, tab_cf, tab_sens, tab_ppa, tab_mc, tab_data = st.tabs(
     ["Summary", "Cash flows", "Sensitivities", "PPA solve", "Monte Carlo", "Data & model"])
 
@@ -213,13 +235,17 @@ RECs bundled in the PPA (no separate REC revenue during the contract); no termin
 
 # ------------------------------- run cases ----------------------------------
 B = run_model(P, 150, pv_bos_b); A = run_model(P, 300, pv_bos_a)
-fmt_pct = lambda v: "n/m" if np.isnan(v) else f"{v*100:.2f}%"
-fmt_mm = lambda v: f"${v/1e6:,.1f}mm"
+def fmt_pct(v):
+    return "n/m" if v is None or not np.isfinite(v) else f"{v*100:.2f}%"
+def fmt_mm(v):
+    return "n/m" if v is None or not np.isfinite(v) else f"${v/1e6:,.1f}mm"
+def fmt_bps(a, b):
+    return "n/m" if not (np.isfinite(a) and np.isfinite(b)) else f"{(a-b)*1e4:+.0f}"
 
 with tab_sum:
     c = st.columns(4)
-    c[0].metric("Base after-tax IRR", fmt_pct(B['irr_at']), delta=f"{(B['irr_at']-target)*1e4:+.0f} bps vs target")
-    c[1].metric("Alternate after-tax IRR", fmt_pct(A['irr_at']), delta=f"{(A['irr_at']-B['irr_at'])*1e4:+.0f} bps vs Base")
+    c[0].metric("Base after-tax IRR", fmt_pct(B['irr_at']), delta=f"{fmt_bps(B['irr_at'], target)} bps vs target")
+    c[1].metric("Alternate after-tax IRR", fmt_pct(A['irr_at']), delta=f"{fmt_bps(A['irr_at'], B['irr_at'])} bps vs Base")
     c[2].metric("Base NPV @ disc", fmt_mm(B['npv']))
     c[3].metric("Alternate NPV @ disc", fmt_mm(A['npv']))
     df = pd.DataFrame({
@@ -235,8 +261,11 @@ with tab_sum:
     })
     st.dataframe(df, hide_index=True, use_container_width=True)
     st.subheader("Tax structure comparison (everything else as set in the sidebar)")
+    st.caption("The credit is worth ~$55.6mm on paper. What it is worth in cash depends entirely on who can use it and when — "
+               "that is the whole story of this table.")
     trow = []
-    for lbl in ["ITC transfer + NOL carryforward (primary)", "NOL carryforward (conservative)", "Immediate monetisation"]:
+    for lbl in ["ITC transfer + NOL carryforward (primary)", "NOL carryforward, ITC used in full Yr 1",
+                "Immediate monetisation", "ITC carried forward + NOL (no outside taxpayer)"]:
         b_ = run_model(P, 150, pv_bos_b, tax_mode=lbl); a_ = run_model(P, 300, pv_bos_a, tax_mode=lbl)
         trow.append([lbl, fmt_pct(b_['irr_at']), fmt_mm(b_['npv']), fmt_pct(a_['irr_at']), fmt_mm(a_['npv']),
                      f"${solve_ppa(P, 150, pv_bos_b, target, tax_mode=lbl):.2f}", f"${solve_ppa(P, 300, pv_bos_a, target, tax_mode=lbl):.2f}"])
@@ -287,10 +316,13 @@ with tab_sens:
     rows = []
     for lbl, kw in shocks.items():
         mb = run_model(P, 150, pv_bos_b, **kw); ma = run_model(P, 300, pv_bos_a, **kw)
-        rows.append([lbl, fmt_pct(mb['irr_at']), f"{(mb['irr_at']-B['irr_at'])*1e4:+.0f}", fmt_mm(mb['npv']-B['npv']),
-                     fmt_pct(ma['irr_at']), f"{(ma['irr_at']-A['irr_at'])*1e4:+.0f}", fmt_mm(ma['npv']-A['npv'])])
-    st.dataframe(pd.DataFrame(rows, columns=["Sensitivity", "Base IRR", "Δbps", "ΔNPV", "Alt IRR", "Δbps", "ΔNPV"]),
-                 hide_index=True, use_container_width=True)
+        rows.append([lbl, fmt_pct(mb['irr_at']), fmt_bps(mb['irr_at'], B['irr_at']), fmt_mm(mb['npv']-B['npv']),
+                     fmt_pct(ma['irr_at']), fmt_bps(ma['irr_at'], A['irr_at']), fmt_mm(ma['npv']-A['npv'])])
+    sens_df = pd.DataFrame(rows, columns=["Sensitivity", "Base IRR", "Base Δbps", "Base ΔNPV",
+                                          "Alt IRR", "Alt Δbps", "Alt ΔNPV"])
+    st.dataframe(sens_df, hide_index=True, use_container_width=True)
+    st.download_button("Download sensitivity table (CSV)", sens_df.to_csv(index=False),
+                       "sensitivities.csv", key="dl_sens")
     st.subheader("Tornado — NPV impact per DC watt (Base case, so scale is comparable)")
     wpb = 150 * dcac * 1e6; wpa = 300 * dcac * 1e6
     torn = {
@@ -310,11 +342,13 @@ with tab_sens:
 with tab_ppa:
     st.subheader(f"15-year PPA price required for a {target*100:.2f}% after-tax IRR")
     pb = solve_ppa(P, 150, pv_bos_b, target); pa = solve_ppa(P, 300, pv_bos_a, target)
-    pe = solve_ppa(P, 300, pv_bos_a, B['irr_at']) if not np.isnan(B['irr_at']) else np.nan
+    pe = solve_ppa(P, 300, pv_bos_a, B['irr_at']) if np.isfinite(B['irr_at']) else np.nan
     c = st.columns(3)
-    c[0].metric("Base", f"${pb:.2f}/MWh", delta=f"{pb-ppa:+.2f} vs current")
-    c[1].metric("Alternate", f"${pa:.2f}/MWh", delta=f"{pa-pb:+.2f} vs Base")
-    c[2].metric("Alternate PPA matching Base IRR", f"${pe:.2f}/MWh" if not np.isnan(pe) else "n/m")
+    money = lambda v: "n/m" if not np.isfinite(v) else f"${v:.2f}/MWh"
+    delta = lambda a, b: None if not (np.isfinite(a) and np.isfinite(b)) else f"{a-b:+.2f}"
+    c[0].metric("Base", money(pb), delta=delta(pb, ppa))
+    c[1].metric("Alternate", money(pa), delta=delta(pa, pb))
+    c[2].metric("Alternate PPA matching Base IRR", money(pe))
     rng = np.arange(0.05, 0.1001, 0.005)
     lad_b = [solve_ppa(P, 150, pv_bos_b, t) for t in rng]; lad_a = [solve_ppa(P, 300, pv_bos_a, t) for t in rng]
     fig = go.Figure()
@@ -327,6 +361,8 @@ with tab_ppa:
     st.markdown("**NPV impact of overlays at the solved PPA**")
     rows = []
     for nm_, mw, pv, p_ in [("Base", 150, pv_bos_b, pb), ("Alternate", 300, pv_bos_a, pa)]:
+        if not np.isfinite(p_):
+            rows.append([nm_, "n/m", "n/m"]); continue
         r0 = run_model(P, mw, pv, ppa=p_)['npv']
         rows.append([nm_, fmt_mm(run_model(P, mw, pv, ppa=p_, rec=rec+5)['npv'] - r0),
                      fmt_mm(run_model(P, mw, pv, ppa=p_, life=40, price_mode=1)['npv'] - r0)])
@@ -337,7 +373,7 @@ with tab_mc:
     st.caption("Each trial multiplies the whole post-PPA price curve by a lognormal shock and adds an "
                "independent annual noise term. Everything else held at sidebar values.")
     c1, c2, c3, c4 = st.columns(4)
-    n_sim = c1.slider("Trials", 200, 5000, 1000, 100)
+    n_sim = c1.slider("Trials", 200, 5000, 1000, 100, help="Each trial re-runs all 35 years. 1,000 is plenty for a stable answer.")
     level_sd = c2.slider("Curve-level σ (%)", 0, 60, 25) / 100
     noise_sd = c3.slider("Annual noise σ (%)", 0, 30, 8) / 100
     case = c4.radio("Case", ["Base", "Alternate"], horizontal=True)
@@ -350,13 +386,19 @@ with tab_mc:
         noise = np.exp(rng_.normal(-0.5 * noise_sd**2, noise_sd, size=len(base_curve)))
         m = run_model(P, mw, pv, merchant=(base_curve * lvl * noise).tolist())
         irrs.append(m['irr_at']); npvs.append(m['npv'])
-    irrs = np.array(irrs); npvs = np.array(npvs)
+    irrs = np.array(irrs, dtype=float); npvs = np.array(npvs, dtype=float)
+    ok = np.isfinite(irrs)
+    if ok.sum() == 0:
+        st.warning("No trial produced a solvable IRR at these settings. Widen the inputs and retry.")
+        st.stop()
+    if ok.sum() < len(irrs):
+        st.caption(f"{len(irrs) - int(ok.sum())} of {len(irrs)} trials had no solvable IRR and are excluded from the IRR statistics.")
     k = st.columns(4)
-    k[0].metric("P(IRR < target)", f"{np.mean(irrs < target)*100:.0f}%")
+    k[0].metric("P(IRR < target)", f"{np.mean(irrs[ok] < target)*100:.0f}%")
     k[1].metric("P(NPV < 0)", f"{np.mean(npvs < 0)*100:.0f}%")
-    k[2].metric("P10 / P50 / P90 IRR", f"{np.nanpercentile(irrs,10)*100:.1f} / {np.nanpercentile(irrs,50)*100:.1f} / {np.nanpercentile(irrs,90)*100:.1f}%")
+    k[2].metric("P10 / P50 / P90 IRR", f"{np.percentile(irrs[ok],10)*100:.1f} / {np.percentile(irrs[ok],50)*100:.1f} / {np.percentile(irrs[ok],90)*100:.1f}%")
     k[3].metric("P10 / P90 NPV", f"{np.percentile(npvs,10)/1e6:.0f} / {np.percentile(npvs,90)/1e6:.0f} $mm")
-    fig = go.Figure(go.Histogram(x=irrs*100, nbinsx=50, marker_color="#14213D"))
+    fig = go.Figure(go.Histogram(x=irrs[ok]*100, nbinsx=50, marker_color="#14213D"))
     fig.add_vline(x=target*100, line_color="#C15A3F", line_dash="dash", annotation_text="target")
     fig.update_layout(height=320, xaxis_title="After-tax IRR (%)", yaxis_title="Trials", margin=dict(l=40, r=40, t=20, b=40))
     st.plotly_chart(fig, use_container_width=True)
