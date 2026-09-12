@@ -147,32 +147,32 @@ st.caption("150 MWac Base vs 300 MWac Alternate · every assumption is live · "
 with st.sidebar:
     st.header("Assumptions")
     with st.expander("Contract & production", expanded=True):
-        ppa = st.number_input("PPA price ($/MWh)", 0.0, 200.0, 25.0, 0.25)
-        ppa_term = st.slider("PPA term (years)", 5, 30, 15)
-        ppa_esc = st.number_input("PPA escalation (%/yr)", 0.0, 5.0, 0.0, 0.25) / 100
-        life = st.slider("Useful life (years)", 20, 45, 35)
-        yld = st.number_input("Yield (kWh/kWp, pre-derate)", 1000, 3000, 2200, 10)
-        degr = st.number_input("Degradation (%/yr)", 0.0, 2.0, 0.5, 0.05) / 100
-        avail = st.number_input("Availability de-rate (%)", 0.0, 10.0, 1.0, 0.25) / 100
-        dcac = st.number_input("DC/AC ratio", 1.0, 2.0, 1.4, 0.05)
+        ppa = st.number_input("PPA price ($/MWh)", 0.0, 200.0, 25.0, 0.25, key="k_ppa")
+        ppa_term = st.slider("PPA term (years)", 5, 30, 15, key="k_ppaterm")
+        ppa_esc = st.number_input("PPA escalation (%/yr)", 0.0, 5.0, 0.0, 0.25, key="k_ppaesc") / 100
+        life = st.slider("Useful life (years)", 20, 45, 35, key="k_life")
+        yld = st.number_input("Yield (kWh/kWp, pre-derate)", 1000, 3000, 2200, 10, key="k_yield")
+        degr = st.number_input("Degradation (%/yr)", 0.0, 2.0, 0.5, 0.05, key="k_degr") / 100
+        avail = st.number_input("Availability de-rate (%)", 0.0, 10.0, 1.0, 0.25, key="k_avail") / 100
+        dcac = st.number_input("DC/AC ratio", 1.0, 2.0, 1.4, 0.05, key="k_dcac")
     with st.expander("CapEx ($/Wp unless noted)"):
-        module = st.number_input("Modules", 0.0, 2.0, 0.35, 0.01)
-        pv_bos_b = st.number_input("PV BOS — Base", 0.0, 2.0, 0.50, 0.01)
-        pv_bos_a = st.number_input("PV BOS — Alternate", 0.0, 2.0, 0.48, 0.01)
-        hv_bos = st.number_input("HV BOS", 0.0, 1.0, 0.05, 0.01)
-        dev = st.number_input("Development", 0.0, 1.0, 0.05, 0.01)
-        interconnect = st.number_input("Interconnection ($, fixed per project)", 0.0, 1e8, 1e7, 5e5, format="%.0f")
+        module = st.number_input("Modules", 0.0, 2.0, 0.35, 0.01, key="k_mod")
+        pv_bos_b = st.number_input("PV BOS — Base", 0.0, 2.0, 0.50, 0.01, key="k_pvbosb")
+        pv_bos_a = st.number_input("PV BOS — Alternate", 0.0, 2.0, 0.48, 0.01, key="k_pvbosa")
+        hv_bos = st.number_input("HV BOS", 0.0, 1.0, 0.05, 0.01, key="k_hvbos")
+        dev = st.number_input("Development", 0.0, 1.0, 0.05, 0.01, key="k_dev")
+        interconnect = st.number_input("Interconnection ($, fixed per project)", 0.0, 1e8, 1e7, 5e5, format="%.0f", key="k_intx")
     with st.expander("OpEx"):
-        om_cov = st.number_input("Covered O&M ($/MWac/yr)", 0.0, 50000.0, 6500.0, 100.0)
-        om_non = st.number_input("Non-covered O&M ($/MWac/yr)", 0.0, 50000.0, 2000.0, 100.0)
-        om_esc = st.number_input("O&M escalation (%/yr)", 0.0, 6.0, 2.0, 0.25) / 100
-        am = st.number_input("Asset management ($/yr, fixed)", 0.0, 2e6, 125000.0, 5000.0)
-        am_esc = st.number_input("Asset mgmt escalation (%/yr)", 0.0, 6.0, 2.0, 0.25) / 100
-        acres_per_mw = st.number_input("Land (acres/MWac)", 1.0, 15.0, 7.0, 0.5)
-        land = st.number_input("Land lease ($/acre/yr)", 0.0, 5000.0, 475.0, 25.0)
-        land_esc = st.number_input("Land escalation (%/yr)", 0.0, 6.0, 2.5, 0.25) / 100
-        ptax = st.number_input("Property tax ($/acre/yr)", 0.0, 2000.0, 75.0, 5.0)
-        ptax_esc = st.number_input("Property tax escalation (%/yr)", 0.0, 6.0, 2.0, 0.25) / 100
+        om_cov = st.number_input("Covered O&M ($/MWac/yr)", 0.0, 50000.0, 6500.0, 100.0, key="k_omcov")
+        om_non = st.number_input("Non-covered O&M ($/MWac/yr)", 0.0, 50000.0, 2000.0, 100.0, key="k_omnon")
+        om_esc = st.number_input("O&M escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_omesc") / 100
+        am = st.number_input("Asset management ($/yr, fixed)", 0.0, 2e6, 125000.0, 5000.0, key="k_am")
+        am_esc = st.number_input("Asset mgmt escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_amesc") / 100
+        acres_per_mw = st.number_input("Land (acres/MWac)", 1.0, 15.0, 7.0, 0.5, key="k_acres")
+        land = st.number_input("Land lease ($/acre/yr)", 0.0, 5000.0, 475.0, 25.0, key="k_land")
+        land_esc = st.number_input("Land escalation (%/yr)", 0.0, 6.0, 2.5, 0.25, key="k_landesc") / 100
+        ptax = st.number_input("Property tax ($/acre/yr)", 0.0, 2000.0, 75.0, 5.0, key="k_ptax")
+        ptax_esc = st.number_input("Property tax escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_ptaxesc") / 100
     with st.expander("Tax & finance", expanded=True):
         tax_mode = st.radio("Tax structure",
                             ["ITC transfer + NOL carryforward (primary)",
@@ -183,20 +183,21 @@ with st.sidebar:
                                  "project. NOL/ITC-in-full: books the whole credit in Year 1 while paying no tax for 17 years — flattering "
                                  "but internally inconsistent. IMMEDIATE: a sponsor with other taxable income absorbs every loss as cash "
                                  "(upper bound). CARRIED FORWARD: the consistent version of going it alone — the credit waits until the "
-                                 "project actually owes tax.")
-        transfer = st.slider("ITC transfer price (¢ per $1 of credit)", 80, 100, 93, 1,
+                                 "project actually owes tax.", key="k_taxmode")
+        transfer = st.slider("ITC transfer price (¢ per $1 of credit)", 80, 100, 93, 1, key="k_transfer",
                              disabled=not tax_mode.startswith("ITC transfer")) / 100
-        itc_rate = st.number_input("ITC rate (%)", 0.0, 60.0, 30.0, 1.0) / 100
-        itc_elig = st.number_input("ITC eligibility on modules+BOS+dev (%)", 0.0, 100.0, 98.0, 1.0) / 100
-        tax_rate = st.number_input("Federal tax rate (%)", 0.0, 50.0, 21.0, 0.5) / 100
-        disc = st.number_input("Discount rate (%)", 0.0, 20.0, 7.0, 0.25) / 100
-        target = st.number_input("Target after-tax IRR for PPA solve (%)", 0.0, 20.0, 7.5, 0.25) / 100
+        itc_rate = st.number_input("ITC rate (%)", 0.0, 60.0, 30.0, 1.0, key="k_itcrate") / 100
+        itc_elig = st.number_input("ITC eligibility on modules+BOS+dev (%)", 0.0, 100.0, 98.0, 1.0, key="k_itcelig") / 100
+        tax_rate = st.number_input("Federal tax rate (%)", 0.0, 50.0, 21.0, 0.5, key="k_taxrate") / 100
+        disc = st.number_input("Discount rate (%)", 0.0, 20.0, 7.0, 0.25, key="k_disc") / 100
+        target = st.number_input("Target after-tax IRR for PPA solve (%)", 0.0, 20.0, 7.5, 0.25, key="k_target") / 100
     with st.expander("Merchant tail"):
-        rec = st.number_input("Merchant REC adder ($/MWh, post-PPA)", 0.0, 50.0, 0.0, 0.5)
-        merch_haircut = st.slider("Merchant price haircut (%)", -50, 50, 0) / 100
+        rec = st.number_input("Merchant REC adder ($/MWh, post-PPA)", 0.0, 50.0, 0.0, 0.5, key="k_rec")
+        merch_haircut = st.slider("Merchant price haircut (%)", -50, 50, 0, key="k_haircut") / 100
         price_mode = st.radio("Post-PPA price path", [1, 2], format_func=lambda x:
-                              "1 — supplied curve, then +esc after Y35 (company-confirmed)" if x == 1 else "2 — anchor Y16, +esc from Y17 (exploratory)")
-        post_esc = st.number_input("Escalation beyond curve (%/yr)", 0.0, 6.0, 2.0, 0.25) / 100
+                              "1 — supplied curve, then +esc after Y35 (company-confirmed)" if x == 1 else "2 — anchor Y16, +esc from Y17 (exploratory)",
+                              key="k_pricemode")
+        post_esc = st.number_input("Escalation beyond curve (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_postesc") / 100
 
 P = dict(ppa=ppa, ppa_term=ppa_term, ppa_esc=ppa_esc, life=life, yld=yld, degr=degr, avail=avail,
          dcac=dcac, module=module, hv_bos=hv_bos, dev=dev, interconnect=interconnect,
@@ -206,6 +207,11 @@ P = dict(ppa=ppa, ppa_term=ppa_term, ppa_esc=ppa_esc, life=life, yld=yld, degr=d
          merch_haircut=merch_haircut, price_mode=price_mode, post_esc=post_esc,
          merchant=MERCHANT_DEFAULT, depr=DEPR_DEFAULT)
 
+# NOTE: every widget below carries an explicit unique key=. Streamlit derives a widget's
+# internal id from its type + label + options when no key is given, so two identical
+# widgets (e.g. a "Case" radio in two different tabs) collide and raise
+# StreamlitDuplicateElementId. Explicit keys make that impossible.
+#
 # NOTE: Streamlit executes this script top-to-bottom in a single pass. An exception
 # inside any `with tab_x:` block aborts the whole run, so every tab defined LATER in
 # the file also fails to render. Keep each block defensive.
@@ -278,7 +284,7 @@ with tab_sum:
     s3.metric("$/Wp reduction", f"${B['perwp']-A['perwp']:.4f}", delta=f"{(A['perwp']/B['perwp']-1)*100:.1f}%")
 
 with tab_cf:
-    which = st.radio("Case", ["Base", "Alternate"], horizontal=True)
+    which = st.radio("Case", ["Base", "Alternate"], horizontal=True, key="k_case_cashflow")
     M = B if which == "Base" else A
     fig = go.Figure()
     fig.add_bar(x=M['yr'], y=M['ppa_rev']/1e6, name="PPA revenue", marker_color="#14213D")
@@ -302,7 +308,7 @@ with tab_cf:
                                    "Depreciation": M['dep'].round(0), "Tax": M['tax'].round(0), "After-tax CF": M['atcf'].round(0)}),
                      hide_index=True, use_container_width=True, height=400)
         csv = pd.DataFrame({"Year": np.arange(0, len(M['aft'])), "After-tax CF": M['aft']}).to_csv(index=False)
-        st.download_button("Download cash flows (CSV)", csv, f"{which.lower()}_cashflows.csv")
+        st.download_button("Download cash flows (CSV)", csv, f"{which.lower()}_cashflows.csv", key="k_dl_cf")
 
 with tab_sens:
     st.subheader("One-at-a-time sensitivities (both cases)")
@@ -373,10 +379,10 @@ with tab_mc:
     st.caption("Each trial multiplies the whole post-PPA price curve by a lognormal shock and adds an "
                "independent annual noise term. Everything else held at sidebar values.")
     c1, c2, c3, c4 = st.columns(4)
-    n_sim = c1.slider("Trials", 200, 5000, 1000, 100, help="Each trial re-runs all 35 years. 1,000 is plenty for a stable answer.")
-    level_sd = c2.slider("Curve-level σ (%)", 0, 60, 25) / 100
-    noise_sd = c3.slider("Annual noise σ (%)", 0, 30, 8) / 100
-    case = c4.radio("Case", ["Base", "Alternate"], horizontal=True)
+    n_sim = c1.slider("Trials", 200, 5000, 1000, 100, key="k_nsim", help="Each trial re-runs all 35 years. 1,000 is plenty for a stable answer.")
+    level_sd = c2.slider("Curve-level σ (%)", 0, 60, 25, key="k_levelsd") / 100
+    noise_sd = c3.slider("Annual noise σ (%)", 0, 30, 8, key="k_noisesd") / 100
+    case = c4.radio("Case", ["Base", "Alternate"], horizontal=True, key="k_case_montecarlo")
     mw, pv = (150, pv_bos_b) if case == "Base" else (300, pv_bos_a)
     rng_ = np.random.default_rng(42)
     base_curve = np.array(P['merchant'], dtype=float)
@@ -390,15 +396,18 @@ with tab_mc:
     ok = np.isfinite(irrs)
     if ok.sum() == 0:
         st.warning("No trial produced a solvable IRR at these settings. Widen the inputs and retry.")
-        st.stop()
-    if ok.sum() < len(irrs):
+        ok = None
+    if ok is not None and ok.sum() < len(irrs):
         st.caption(f"{len(irrs) - int(ok.sum())} of {len(irrs)} trials had no solvable IRR and are excluded from the IRR statistics.")
     k = st.columns(4)
-    k[0].metric("P(IRR < target)", f"{np.mean(irrs[ok] < target)*100:.0f}%")
+    if ok is None:
+        st.stop_placeholder = True
+    k[0].metric("P(IRR < target)", f"{np.mean(irrs[ok] < target)*100:.0f}%" if ok is not None else "n/m")
     k[1].metric("P(NPV < 0)", f"{np.mean(npvs < 0)*100:.0f}%")
-    k[2].metric("P10 / P50 / P90 IRR", f"{np.percentile(irrs[ok],10)*100:.1f} / {np.percentile(irrs[ok],50)*100:.1f} / {np.percentile(irrs[ok],90)*100:.1f}%")
+    k[2].metric("P10 / P50 / P90 IRR", f"{np.percentile(irrs[ok],10)*100:.1f} / {np.percentile(irrs[ok],50)*100:.1f} / {np.percentile(irrs[ok],90)*100:.1f}%" if ok is not None else "n/m")
     k[3].metric("P10 / P90 NPV", f"{np.percentile(npvs,10)/1e6:.0f} / {np.percentile(npvs,90)/1e6:.0f} $mm")
-    fig = go.Figure(go.Histogram(x=irrs[ok]*100, nbinsx=50, marker_color="#14213D"))
+    fig = go.Figure(go.Histogram(x=(irrs[ok] if ok is not None else irrs[np.isfinite(irrs)])*100,
+                                 nbinsx=50, marker_color="#14213D"))
     fig.add_vline(x=target*100, line_color="#C15A3F", line_dash="dash", annotation_text="target")
     fig.update_layout(height=320, xaxis_title="After-tax IRR (%)", yaxis_title="Trials", margin=dict(l=40, r=40, t=20, b=40))
     st.plotly_chart(fig, use_container_width=True)
