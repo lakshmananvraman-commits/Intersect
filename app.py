@@ -24,7 +24,7 @@ DEPR_DEFAULT = [0.19486836652891062, 0.31230254979336591, 0.18835654023552645,
                [0.00202011883222884] * 9 + [0.00101005941611442]
 
 # ----------------------------------------------------------------------------
-# Core engine (identical logic to the Excel model, both tax conventions)
+# Core engine (identical logic to the Excel model; four selectable tax structures)
 # ----------------------------------------------------------------------------
 def irr(cf, lo=-0.99, hi=2.0):
     def f(r): return sum(c / (1 + r) ** i for i, c in enumerate(cf))
@@ -93,21 +93,26 @@ def run_model(p, mwac, pv_bos, ppa=None, life=None, rec=None, mod=None, mh=None,
     tax = np.zeros(n); nol = 0.0
     for i in range(n):
         ti = ebitda[i] - dep[i]
-        if tax_mode == "Immediate monetisation":
-            tax[i] = ti * p['tax_rate']
+        if tax_mode.startswith("Sponsor tax appetite"):
+            tax[i] = ti * p['tax_rate']                       # negative = immediate benefit
         else:
-            used = min(max(ti, 0.0), nol)
-            tax[i] = (max(ti, 0.0) - used) * p['tax_rate']
+            positive_ti = max(ti, 0.0)
+            used = min(nol, p['nol_limit'] * positive_ti)     # post-2017 80% limitation
+            taxable_after_nol = positive_ti - used
+            tax[i] = taxable_after_nol * p['tax_rate']
             nol = nol - used + max(-ti, 0.0)
     itc_cash = itc * (transfer if tax_mode.startswith("ITC transfer") else 1.0)
     itc_flow = np.zeros(n)
-    if tax_mode.startswith("ITC carried forward"):
-        # A tax credit can only offset tax actually owed, so it waits in a bank
-        # until the project has a liability. No cash arrives in Year 1.
-        bank = itc
+    if tax_mode.startswith("Standalone project"):
+        # ITC is a credit against tax owed (after NOLs), not a deduction. It waits in a
+        # bank until the project has a liability and is drawn down subject to the
+        # carryforward period. No proceeds in Year 1. Illustrative only.
+        bank = itc; born = 0
         for i in range(n):
+            if i - born > p['itc_carry_years']:
+                bank = 0.0                                # credit expires
             use = min(tax[i], bank); bank -= use; tax[i] -= use
-        itc_cash = itc - bank                      # portion ever used
+        itc_cash = itc - bank                              # portion ever used
     else:
         itc_flow[0] = itc_cash
     atcf = ebitda - tax + itc_flow
@@ -142,7 +147,7 @@ def solve_ppa(p, mwac, pv_bos, target, **kw):
 st.set_page_config(page_title="Solar Project Stress Test", page_icon="☀️", layout="wide")
 st.title("☀️ Utility-Scale Solar — Stress-Test Dashboard")
 st.caption("150 MWac Base vs 300 MWac Alternate · every assumption is live · "
-           "reconciles to Intersect_Solar_Model_v3.xlsx to the cent at default inputs, all three tax structures")
+           "default assumptions reconcile to the final Intersect financial model")
 
 with st.sidebar:
     st.header("Assumptions")
@@ -175,17 +180,23 @@ with st.sidebar:
         ptax_esc = st.number_input("Property tax escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_ptaxesc") / 100
     with st.expander("Tax & finance", expanded=True):
         tax_mode = st.radio("Tax structure",
-                            ["ITC transfer + NOL carryforward (primary)",
-                             "NOL carryforward, ITC used in full Yr 1",
-                             "Immediate monetisation",
-                             "ITC carried forward + NOL (no outside taxpayer)"],
-                            help="PRIMARY: credit sold to a third party under IRA §6418 at a discount; depreciation losses stay with the "
-                                 "project. NOL/ITC-in-full: books the whole credit in Year 1 while paying no tax for 17 years — flattering "
-                                 "but internally inconsistent. IMMEDIATE: a sponsor with other taxable income absorbs every loss as cash "
-                                 "(upper bound). CARRIED FORWARD: the consistent version of going it alone — the credit waits until the "
-                                 "project actually owes tax.", key="k_taxmode")
+                            ["ITC transfer at 93¢ + project-level NOL carryforward (primary)",
+                             "Full-face ITC monetisation (100¢) + project-level NOL carryforward — benchmark",
+                             "Sponsor tax appetite / immediate tax-loss monetisation — upper bound",
+                             "Standalone project — ITC carried forward + NOL carryforward (illustrative)"],
+                            help="PRIMARY: ITC transferred in Year 1 at the slider price; depreciation stays with the project and early "
+                                 "losses accumulate as NOLs, used subject to the 80% limitation. 93¢ is an analyst-selected assumption. "
+                                 "BENCHMARK: identical NOL treatment; ITC proceeds at 100¢ instead. Shows the economics if the credit can be "
+                                 "monetised at face value. SPONSOR: full ITC and each year's negative taxable income have immediate value to "
+                                 "a sponsor with taxable income elsewhere — an upper bound on tax efficiency. STANDALONE: no Year-1 ITC "
+                                 "proceeds; NOLs applied first, then the credit offsets remaining federal tax, subject to a carryforward "
+                                 "period. Illustrative standalone tax-appetite case, not a tax-return simulation.", key="k_taxmode")
         transfer = st.slider("ITC transfer price (¢ per $1 of credit)", 80, 100, 93, 1, key="k_transfer",
                              disabled=not tax_mode.startswith("ITC transfer")) / 100
+        nol_limit = st.slider("NOL utilisation limit (% of taxable income)", 50, 100, 80, 5, key="k_nollimit",
+                              help="Post-2017 federal rule: NOLs may offset at most 80% of taxable income. Applies to all carryforward structures.") / 100
+        itc_carry_years = st.slider("ITC carryforward period (years, standalone case only)", 5, 30, 22, 1, key="k_itccarry",
+                                    disabled=not tax_mode.startswith("Standalone"))
         itc_rate = st.number_input("ITC rate (%)", 0.0, 60.0, 30.0, 1.0, key="k_itcrate") / 100
         itc_elig = st.number_input("ITC eligibility on modules+BOS+dev (%)", 0.0, 100.0, 98.0, 1.0, key="k_itcelig") / 100
         tax_rate = st.number_input("Federal tax rate (%)", 0.0, 50.0, 21.0, 0.5, key="k_taxrate") / 100
@@ -204,6 +215,7 @@ P = dict(ppa=ppa, ppa_term=ppa_term, ppa_esc=ppa_esc, life=life, yld=yld, degr=d
          om_cov=om_cov, om_non=om_non, om_esc=om_esc, am=am, am_esc=am_esc, acres_per_mw=acres_per_mw,
          land=land, land_esc=land_esc, ptax=ptax, ptax_esc=ptax_esc, tax_mode=tax_mode,
          itc_rate=itc_rate, itc_elig=itc_elig, tax_rate=tax_rate, disc=disc, rec=rec, transfer=transfer,
+         nol_limit=nol_limit, itc_carry_years=itc_carry_years,
          merch_haircut=merch_haircut, price_mode=price_mode, post_esc=post_esc,
          merchant=MERCHANT_DEFAULT, depr=DEPR_DEFAULT)
 
@@ -235,8 +247,9 @@ with tab_data:
         st.metric("Schedule total", f"{sum(P['depr'])*100:.2f}%")
     st.markdown("""
 **Conventions (all editable above):** CapEx at t=0; Year 1 = first operating year; end-year discounting;
-unlevered all-equity; ITC monetised in Year 1; depreciable basis = CapEx − 50% × ITC;
-RECs bundled in the PPA (no separate REC revenue during the contract); no terminal value.
+unlevered all-equity; depreciable basis = CapEx − 50% × ITC; NOL use capped at the sidebar limit (80% default);
+ITC proceeds in Year 1 under the transfer, benchmark and sponsor structures — carried forward against future
+tax under the standalone structure; RECs bundled in the PPA (no separate REC revenue during the contract); no terminal value.
 """)
 
 # ------------------------------- run cases ----------------------------------
@@ -267,11 +280,13 @@ with tab_sum:
     })
     st.dataframe(df, hide_index=True, use_container_width=True)
     st.subheader("Tax structure comparison (everything else as set in the sidebar)")
-    st.caption("The credit is worth ~$55.6mm on paper. What it is worth in cash depends entirely on who can use it and when — "
-               "that is the whole story of this table.")
+    st.caption("The ITC is generated at the same face value in every structure. Structures differ only in when and at what price "
+               "the credit and the early tax losses can be turned into cash. The standalone row is illustrative.")
     trow = []
-    for lbl in ["ITC transfer + NOL carryforward (primary)", "NOL carryforward, ITC used in full Yr 1",
-                "Immediate monetisation", "ITC carried forward + NOL (no outside taxpayer)"]:
+    for lbl in ["ITC transfer at 93¢ + project-level NOL carryforward (primary)",
+                "Full-face ITC monetisation (100¢) + project-level NOL carryforward — benchmark",
+                "Sponsor tax appetite / immediate tax-loss monetisation — upper bound",
+                "Standalone project — ITC carried forward + NOL carryforward (illustrative)"]:
         b_ = run_model(P, 150, pv_bos_b, tax_mode=lbl); a_ = run_model(P, 300, pv_bos_a, tax_mode=lbl)
         trow.append([lbl, fmt_pct(b_['irr_at']), fmt_mm(b_['npv']), fmt_pct(a_['irr_at']), fmt_mm(a_['npv']),
                      f"${solve_ppa(P, 150, pv_bos_b, target, tax_mode=lbl):.2f}", f"${solve_ppa(P, 300, pv_bos_a, target, tax_mode=lbl):.2f}"])
@@ -413,5 +428,5 @@ with tab_mc:
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.caption("Model: unlevered, nominal, end-year discounting. Reconciled to Intersect_Solar_Model_v2.xlsx and to an "
-           "independent engine under both tax conventions. Not investment advice.")
+st.caption("Model: unlevered, nominal, end-year discounting. Default assumptions reconcile to Intersect_Solar_Model_FINAL.xlsx "
+           "for the three structures the workbook carries; the standalone structure is dashboard-only and illustrative. Not investment advice.")
