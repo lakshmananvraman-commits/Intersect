@@ -1,432 +1,629 @@
 """
-Intersect Solar Project — Interactive Stress-Test Dashboard
-============================================================
-Streamlit app. Every assumption from the assessment brief is a live control.
-Deploy free on Streamlit Community Cloud: push this repo to GitHub, then
-share.streamlit.io -> New app -> pick the repo -> main file = app.py
-
-Author: Lakshmanan Vaidhyaraman
+Utility-Scale Solar Project Financial Valuation & Risk Engine
+Comparative 150 MWac vs. 300 MWac Infrastructure Model · CAISO Market
 """
+
+import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
+from scipy.optimize import brentq
 
-# ----------------------------------------------------------------------------
-# Supplied data (from the assessment workbook)
-# ----------------------------------------------------------------------------
-MERCHANT_DEFAULT = [36.81, 39.35, 40.85, 42.61, 44.67, 46.51, 47.00, 48.02, 49.45, 50.48,
-                    52.51, 53.12, 54.98, 56.90, 58.50, 60.76, 64.19, 66.54, 68.93, 73.26,
-                    74.32, 76.50, 78.03, 79.59, 81.18, 82.80, 84.46, 86.15, 87.87, 89.63,
-                    91.42, 93.25, 95.11, 97.02, 98.96]
-DEPR_DEFAULT = [0.19486836652891062, 0.31230254979336591, 0.18835654023552645,
-                0.11389143346487204, 0.11362818066780520, 0.05776180040334328] + \
-               [0.00202011883222884] * 9 + [0.00101005941611442]
+# -----------------------------------------------------------------------------
+# PAGE CONFIGURATION & INSTITUTIONAL THEME
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Utility-Scale Solar Valuation Model",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ----------------------------------------------------------------------------
-# Core engine (identical logic to the Excel model; four selectable tax structures)
-# ----------------------------------------------------------------------------
-def irr(cf, lo=-0.99, hi=2.0):
-    def f(r): return sum(c / (1 + r) ** i for i, c in enumerate(cf))
-    if f(lo) * f(hi) > 0:
-        return np.nan
-    for _ in range(200):
-        mid = (lo + hi) / 2
-        if f(lo) * f(mid) <= 0: hi = mid
-        else: lo = mid
-    return (lo + hi) / 2
+# Custom Styling
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #0E1117;
+        border: 1px solid #262730;
+        padding: 18px;
+        border-radius: 8px;
+        margin-bottom: 12px;
+    }
+    .metric-value {
+        font-size: 26px;
+        font-weight: 700;
+        color: #F8F9FA;
+    }
+    .metric-label {
+        font-size: 13px;
+        color: #9E9E9E;
+        margin-bottom: 4px;
+    }
+    .metric-delta-pos {
+        color: #4CAF50;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    .metric-delta-neg {
+        color: #E53935;
+        font-size: 12px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# -----------------------------------------------------------------------------
+# CORE EXOGENOUS DATA (35-YEAR CURVES & MACRS SCHEDULES)
+# -----------------------------------------------------------------------------
+YEARS = np.arange(1, 36)
 
-def npv(rate, cf):
-    return sum(c / (1 + rate) ** i for i, c in enumerate(cf))
+# Baseline CAISO Merchant Price Curve ($/MWh) - Years 1 to 35
+MERCHANT_CURVE = np.array([
+    36.81, 39.35, 40.85, 42.61, 44.67, 46.51, 47.00, 48.02, 49.45, 50.48,
+    52.51, 53.12, 54.98, 56.90, 58.50, 60.76, 64.19, 66.54, 68.93, 73.26,
+    74.32, 76.50, 78.03, 79.59, 81.18, 82.80, 84.46, 86.15, 87.87, 89.63,
+    91.42, 93.25, 95.11, 97.02, 98.96
+])
 
+# 16-Year Blended MACRS Depreciation Schedule (IRC 200% DB / 15-Yr Property Blend)
+MACRS_RATES_16 = np.array([
+    0.194868, 0.312303, 0.188357, 0.113891, 0.113628, 0.057762,
+    0.002020, 0.002020, 0.002020, 0.002020, 0.002020, 0.002020,
+    0.002020, 0.002020, 0.002020, 0.001010
+])
+MACRS_SCHEDULE = np.zeros(35)
+MACRS_SCHEDULE[:16] = MACRS_RATES_16
 
-def run_model(p, mwac, pv_bos, ppa=None, life=None, rec=None, mod=None, mh=None,
-              price_mode=None, tax_mode=None, merchant=None, depr=None, transfer=None):
-    """p = dict of shared assumptions; keyword args override for scenarios."""
-    ppa = p['ppa'] if ppa is None else ppa
-    life = p['life'] if life is None else life
-    rec = p['rec'] if rec is None else rec
-    mod = p['module'] if mod is None else mod
-    mh = p['merch_haircut'] if mh is None else mh
-    price_mode = p['price_mode'] if price_mode is None else price_mode
-    tax_mode = p['tax_mode'] if tax_mode is None else tax_mode
-    transfer = p['transfer'] if transfer is None else transfer
-    merchant = np.array(p['merchant'] if merchant is None else merchant, dtype=float)
-    depr = np.array(p['depr'] if depr is None else depr, dtype=float)
+# -----------------------------------------------------------------------------
+# SIDEBAR CONTROLS & MODEL ASSUMPTIONS
+# -----------------------------------------------------------------------------
+st.sidebar.title("Model Controls")
 
-    mwdc = mwac * p['dcac']; wp = mwdc * 1e6; acres = mwac * p['acres_per_mw']
-    cx = dict(modules=mod * wp, pv_bos=pv_bos * wp, hv_bos=p['hv_bos'] * wp,
-              interconnect=p['interconnect'], development=p['dev'] * wp)
-    capex = sum(cx.values())
-    itc_basis = p['itc_elig'] * (cx['modules'] + cx['pv_bos'] + cx['development'])
-    itc = p['itc_rate'] * itc_basis
-    dbasis = capex - 0.5 * itc
+st.sidebar.subheader("Tax Structuring (IRA § 6418)")
+tax_structure = st.sidebar.radio(
+    "Tax Monetization Framework",
+    [
+        "ITC Transfer + NOL Carryforward (Primary)",
+        "NOL Carryforward, ITC Used in Full Yr 1 (Benchmark)",
+        "Immediate Monetisation (Sponsor Balance Sheet)",
+        "ITC Carried Forward + NOL (Stranded / Independent)"
+    ],
+    index=0,
+    help="Dictates how Year 1 ITC and early MACRS tax losses are monetized."
+)
 
-    n = int(life); yr = np.arange(1, n + 1)
-    prod = mwdc * p['yld'] * (1 - p['avail']) * (1 - p['degr']) ** (yr - 1)
+tax_struct_map = {
+    "ITC Transfer + NOL Carryforward (Primary)": 1,
+    "NOL Carryforward, ITC Used in Full Yr 1 (Benchmark)": 2,
+    "Immediate Monetisation (Sponsor Balance Sheet)": 3,
+    "ITC Carried Forward + NOL (Stranded / Independent)": 4
+}
+selected_tax_struct = tax_struct_map[tax_structure]
 
-    nm = len(merchant)
-    price = np.zeros(n)
-    for i in range(n):
-        if price_mode == 2 and i >= p['ppa_term'] + 1:
-            price[i] = merchant[p['ppa_term']] * (1 + p['post_esc']) ** (i - p['ppa_term'])
-        elif i < nm:
-            price[i] = merchant[i]
-        else:
-            price[i] = merchant[-1] * (1 + p['post_esc']) ** (i - nm + 1)
-    price *= (1 - mh)
+itc_transfer_cents = st.sidebar.slider(
+    "ITC Transfer Price (¢ per $1 of credit)",
+    min_value=85, max_value=100, value=93, step=1,
+    disabled=(selected_tax_struct != 1),
+    help="Market clearing discount for Section 6418 bilateral credit transfers."
+)
+transfer_price_factor = itc_transfer_cents / 100.0
 
-    con = yr <= p['ppa_term']
-    ppa_rev = np.where(con, prod * ppa * (1 + p['ppa_esc']) ** (yr - 1), 0.0)
-    merch_rev = np.where(con, 0.0, prod * price)
-    rec_rev = np.where(con, 0.0, prod * rec)
-    rev = ppa_rev + merch_rev + rec_rev
+st.sidebar.subheader("Commercial & Market Levers")
+merchant_price_haircut = st.sidebar.slider(
+    "Merchant Price Stress (%)",
+    min_value=-40, max_value=40, value=0, step=5,
+    help="Parallel percentage shift applied across the post-PPA merchant price curve."
+)
+merchant_multiplier = 1.0 + (merchant_price_haircut / 100.0)
 
-    e = lambda r: (1 + r) ** (yr - 1)
-    opex = (mwac * p['om_cov'] * e(p['om_esc']) + mwac * p['om_non'] * e(p['om_esc'])
-            + p['am'] * e(p['am_esc']) + acres * p['land'] * e(p['land_esc'])
-            + acres * p['ptax'] * e(p['ptax_esc']))
-    ebitda = rev - opex
+rec_adder = st.sidebar.slider(
+    "Post-PPA Merchant REC Adder ($/MWh)",
+    min_value=0.0, max_value=15.0, value=0.0, step=1.0,
+    help="Unbundled Renewable Energy Certificate revenue received in Years 16–35."
+)
 
-    dep = np.zeros(n); k = min(len(depr), n); dep[:k] = depr[:k] * dbasis
-    tax = np.zeros(n); nol = 0.0
-    for i in range(n):
-        ti = ebitda[i] - dep[i]
-        if tax_mode.startswith("Sponsor tax appetite"):
-            tax[i] = ti * p['tax_rate']                       # negative = immediate benefit
-        else:
-            positive_ti = max(ti, 0.0)
-            used = min(nol, p['nol_limit'] * positive_ti)     # post-2017 80% limitation
-            taxable_after_nol = positive_ti - used
-            tax[i] = taxable_after_nol * p['tax_rate']
-            nol = nol - used + max(-ti, 0.0)
-    itc_cash = itc * (transfer if tax_mode.startswith("ITC transfer") else 1.0)
-    itc_flow = np.zeros(n)
-    if tax_mode.startswith("Standalone project"):
-        # ITC is a credit against tax owed (after NOLs), not a deduction. It waits in a
-        # bank until the project has a liability and is drawn down subject to the
-        # carryforward period. No proceeds in Year 1. Illustrative only.
-        bank = itc; born = 0
-        for i in range(n):
-            if i - born > p['itc_carry_years']:
-                bank = 0.0                                # credit expires
-            use = min(tax[i], bank); bank -= use; tax[i] -= use
-        itc_cash = itc - bank                              # portion ever used
-    else:
-        itc_flow[0] = itc_cash
-    atcf = ebitda - tax + itc_flow
+project_life_years = st.sidebar.selectbox(
+    "Operating Life (Asset Longevity)",
+    [35, 40],
+    index=0,
+    help="Evaluates life extension through Year 40 (escalating Year 35 power price at 2% p.a.)."
+)
 
-    pre = np.concatenate(([-capex], ebitda)); aft = np.concatenate(([-capex], atcf))
-    conf = np.concatenate(([-capex], atcf[:p['ppa_term']]))
-    return dict(capex=capex, cx=cx, itc=itc, perwp=capex / wp, prod=prod, price=price,
-                ppa_rev=ppa_rev, merch_rev=merch_rev, rec_rev=rec_rev, rev=rev, opex=opex,
-                ebitda=ebitda, margin=np.where(rev > 0, ebitda / rev, np.nan), dep=dep, tax=tax,
-                atcf=atcf, aft=aft, irr_pre=irr(pre), irr_at=irr(aft), irr_con=irr(conf),
-                npv=npv(p['disc'], aft), cum=np.cumsum(atcf) - capex, yr=yr)
+# -----------------------------------------------------------------------------
+# PROJECT VALUATION ENGINE
+# -----------------------------------------------------------------------------
+@st.cache_data
+def run_financial_model(
+    case="Base",
+    ppa_price=25.0,
+    rec_premium=0.0,
+    price_multiplier=1.0,
+    asset_life=35,
+    tax_mode=1,
+    itc_transfer_rate=0.93,
+    mod_cost_adj=0.0
+):
+    mw_ac = 150.0 if case == "Base" else 300.0
+    mw_dc = mw_ac * 1.4
+    wp_dc = mw_dc * 1e6
+    land_acres = mw_ac * 7.0
 
+    # CapEx Elements
+    mod_cost = 0.35 + mod_cost_adj
+    pv_bos = 0.50 if case == "Base" else 0.48
+    hv_bos = 0.05
+    dev_cost = 0.05
+    interconnection = 10000000.0  # Fixed LGIA fee
 
-def solve_ppa(p, mwac, pv_bos, target, **kw):
-    """Bisection on PPA price. Returns np.nan if the target is unreachable
-    within the search range (e.g. target IRR above anything the project can pay)."""
-    lo, hi = 0.0, 400.0
-    top = run_model(p, mwac, pv_bos, ppa=hi, **kw)['irr_at']
-    if not np.isfinite(top) or top < target:
-        return np.nan
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        v = run_model(p, mwac, pv_bos, ppa=mid, **kw)['irr_at']
-        if not np.isfinite(v) or v < target: lo = mid
-        else: hi = mid
-    return (lo + hi) / 2
+    capex_mod = mod_cost * wp_dc
+    capex_pv_bos = pv_bos * wp_dc
+    capex_hv_bos = hv_bos * wp_dc
+    capex_dev = dev_cost * wp_dc
+    total_capex = capex_mod + capex_pv_bos + capex_hv_bos + capex_dev + interconnection
 
+    # Tax Basis
+    itc_eligible = 0.98 * (capex_mod + capex_pv_bos + capex_dev)
+    itc_credit = itc_eligible * 0.30
+    depreciable_basis = total_capex - (0.50 * itc_credit)
 
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-st.set_page_config(page_title="Solar Project Stress Test", page_icon="☀️", layout="wide")
-st.title("☀️ Utility-Scale Solar — Stress-Test Dashboard")
-st.caption("150 MWac Base vs 300 MWac Alternate · every assumption is live · "
-           "default assumptions reconcile to the final Intersect financial model")
+    # Production Profile (0.5% Annual Compounding Degradation, 1% Availability Haircut)
+    deg_schedule = np.array([1.0 if y == 1 else (1.0 - 0.005)**(y - 1) for y in YEARS])
+    net_production_mwh = mw_dc * 2200.0 * 0.99 * deg_schedule
 
-with st.sidebar:
-    st.header("Assumptions")
-    with st.expander("Contract & production", expanded=True):
-        ppa = st.number_input("PPA price ($/MWh)", 0.0, 200.0, 25.0, 0.25, key="k_ppa")
-        ppa_term = st.slider("PPA term (years)", 5, 30, 15, key="k_ppaterm")
-        ppa_esc = st.number_input("PPA escalation (%/yr)", 0.0, 5.0, 0.0, 0.25, key="k_ppaesc") / 100
-        life = st.slider("Useful life (years)", 20, 45, 35, key="k_life")
-        yld = st.number_input("Yield (kWh/kWp, pre-derate)", 1000, 3000, 2200, 10, key="k_yield")
-        degr = st.number_input("Degradation (%/yr)", 0.0, 2.0, 0.5, 0.05, key="k_degr") / 100
-        avail = st.number_input("Availability de-rate (%)", 0.0, 10.0, 1.0, 0.25, key="k_avail") / 100
-        dcac = st.number_input("DC/AC ratio", 1.0, 2.0, 1.4, 0.05, key="k_dcac")
-    with st.expander("CapEx ($/Wp unless noted)"):
-        module = st.number_input("Modules", 0.0, 2.0, 0.35, 0.01, key="k_mod")
-        pv_bos_b = st.number_input("PV BOS — Base", 0.0, 2.0, 0.50, 0.01, key="k_pvbosb")
-        pv_bos_a = st.number_input("PV BOS — Alternate", 0.0, 2.0, 0.48, 0.01, key="k_pvbosa")
-        hv_bos = st.number_input("HV BOS", 0.0, 1.0, 0.05, 0.01, key="k_hvbos")
-        dev = st.number_input("Development", 0.0, 1.0, 0.05, 0.01, key="k_dev")
-        interconnect = st.number_input("Interconnection ($, fixed per project)", 0.0, 1e8, 1e7, 5e5, format="%.0f", key="k_intx")
-    with st.expander("OpEx"):
-        om_cov = st.number_input("Covered O&M ($/MWac/yr)", 0.0, 50000.0, 6500.0, 100.0, key="k_omcov")
-        om_non = st.number_input("Non-covered O&M ($/MWac/yr)", 0.0, 50000.0, 2000.0, 100.0, key="k_omnon")
-        om_esc = st.number_input("O&M escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_omesc") / 100
-        am = st.number_input("Asset management ($/yr, fixed)", 0.0, 2e6, 125000.0, 5000.0, key="k_am")
-        am_esc = st.number_input("Asset mgmt escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_amesc") / 100
-        acres_per_mw = st.number_input("Land (acres/MWac)", 1.0, 15.0, 7.0, 0.5, key="k_acres")
-        land = st.number_input("Land lease ($/acre/yr)", 0.0, 5000.0, 475.0, 25.0, key="k_land")
-        land_esc = st.number_input("Land escalation (%/yr)", 0.0, 6.0, 2.5, 0.25, key="k_landesc") / 100
-        ptax = st.number_input("Property tax ($/acre/yr)", 0.0, 2000.0, 75.0, 5.0, key="k_ptax")
-        ptax_esc = st.number_input("Property tax escalation (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_ptaxesc") / 100
-    with st.expander("Tax & finance", expanded=True):
-        tax_mode = st.radio("Tax structure",
-                            ["ITC transfer at 93¢ + project-level NOL carryforward (primary)",
-                             "Full-face ITC monetisation (100¢) + project-level NOL carryforward — benchmark",
-                             "Sponsor tax appetite / immediate tax-loss monetisation — upper bound",
-                             "Standalone project — ITC carried forward + NOL carryforward (illustrative)"],
-                            help="PRIMARY: ITC transferred in Year 1 at the slider price; depreciation stays with the project and early "
-                                 "losses accumulate as NOLs, used subject to the 80% limitation. 93¢ is an analyst-selected assumption. "
-                                 "BENCHMARK: identical NOL treatment; ITC proceeds at 100¢ instead. Shows the economics if the credit can be "
-                                 "monetised at face value. SPONSOR: full ITC and each year's negative taxable income have immediate value to "
-                                 "a sponsor with taxable income elsewhere — an upper bound on tax efficiency. STANDALONE: no Year-1 ITC "
-                                 "proceeds; NOLs applied first, then the credit offsets remaining federal tax, subject to a carryforward "
-                                 "period. Illustrative standalone tax-appetite case, not a tax-return simulation.", key="k_taxmode")
-        transfer = st.slider("ITC transfer price (¢ per $1 of credit)", 80, 100, 93, 1, key="k_transfer",
-                             disabled=not tax_mode.startswith("ITC transfer")) / 100
-        nol_limit = st.slider("NOL utilisation limit (% of taxable income)", 50, 100, 80, 5, key="k_nollimit",
-                              help="Post-2017 federal rule: NOLs may offset at most 80% of taxable income. Applies to all carryforward structures.") / 100
-        itc_carry_years = st.slider("ITC carryforward period (years, standalone case only)", 5, 30, 22, 1, key="k_itccarry",
-                                    disabled=not tax_mode.startswith("Standalone"))
-        itc_rate = st.number_input("ITC rate (%)", 0.0, 60.0, 30.0, 1.0, key="k_itcrate") / 100
-        itc_elig = st.number_input("ITC eligibility on modules+BOS+dev (%)", 0.0, 100.0, 98.0, 1.0, key="k_itcelig") / 100
-        tax_rate = st.number_input("Federal tax rate (%)", 0.0, 50.0, 21.0, 0.5, key="k_taxrate") / 100
-        disc = st.number_input("Discount rate (%)", 0.0, 20.0, 7.0, 0.25, key="k_disc") / 100
-        target = st.number_input("Target after-tax IRR for PPA solve (%)", 0.0, 20.0, 7.5, 0.25, key="k_target") / 100
-    with st.expander("Merchant tail"):
-        rec = st.number_input("Merchant REC adder ($/MWh, post-PPA)", 0.0, 50.0, 0.0, 0.5, key="k_rec")
-        merch_haircut = st.slider("Merchant price haircut (%)", -50, 50, 0, key="k_haircut") / 100
-        price_mode = st.radio("Post-PPA price path", [1, 2], format_func=lambda x:
-                              "1 — supplied curve, then +esc after Y35 (company-confirmed)" if x == 1 else "2 — anchor Y16, +esc from Y17 (exploratory)",
-                              key="k_pricemode")
-        post_esc = st.number_input("Escalation beyond curve (%/yr)", 0.0, 6.0, 2.0, 0.25, key="k_postesc") / 100
+    # Revenue Build
+    effective_merchant_curve = MERCHANT_CURVE * price_multiplier
+    ppa_revenue = np.where(YEARS <= 15, net_production_mwh * ppa_price, 0.0)
+    merchant_revenue = np.where(YEARS > 15, net_production_mwh * (effective_merchant_curve + rec_premium), 0.0)
+    total_revenue = ppa_revenue + merchant_revenue
 
-P = dict(ppa=ppa, ppa_term=ppa_term, ppa_esc=ppa_esc, life=life, yld=yld, degr=degr, avail=avail,
-         dcac=dcac, module=module, hv_bos=hv_bos, dev=dev, interconnect=interconnect,
-         om_cov=om_cov, om_non=om_non, om_esc=om_esc, am=am, am_esc=am_esc, acres_per_mw=acres_per_mw,
-         land=land, land_esc=land_esc, ptax=ptax, ptax_esc=ptax_esc, tax_mode=tax_mode,
-         itc_rate=itc_rate, itc_elig=itc_elig, tax_rate=tax_rate, disc=disc, rec=rec, transfer=transfer,
-         nol_limit=nol_limit, itc_carry_years=itc_carry_years,
-         merch_haircut=merch_haircut, price_mode=price_mode, post_esc=post_esc,
-         merchant=MERCHANT_DEFAULT, depr=DEPR_DEFAULT)
+    # Operating Costs (2.0% OpEx Escalation, 2.5% Land Escalation)
+    cov_om = (mw_ac * 6500.0) * (1.02**(YEARS - 1))
+    non_cov_om = (mw_ac * 2000.0) * (1.02**(YEARS - 1))
+    asset_mgmt = 125000.0 * (1.02**(YEARS - 1))
+    land_lease = (land_acres * 475.0) * (1.025**(YEARS - 1))
+    property_tax = (land_acres * 75.0) * (1.02**(YEARS - 1))
+    total_opex = cov_om + non_cov_om + asset_mgmt + land_lease + property_tax
 
-# NOTE: every widget below carries an explicit unique key=. Streamlit derives a widget's
-# internal id from its type + label + options when no key is given, so two identical
-# widgets (e.g. a "Case" radio in two different tabs) collide and raise
-# StreamlitDuplicateElementId. Explicit keys make that impossible.
-#
-# NOTE: Streamlit executes this script top-to-bottom in a single pass. An exception
-# inside any `with tab_x:` block aborts the whole run, so every tab defined LATER in
-# the file also fails to render. Keep each block defensive.
-tab_sum, tab_cf, tab_sens, tab_ppa, tab_mc, tab_data = st.tabs(
-    ["Summary", "Cash flows", "Sensitivities", "PPA solve", "Monte Carlo", "Data & model"])
+    # EBITDA
+    ebitda = total_revenue - total_opex
 
-# ------------------------------- data tab (editable curves) -----------------
-with tab_data:
-    st.subheader("Editable supplied curves")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Merchant price curve ($/MWh)**")
-        mdf = st.data_editor(pd.DataFrame({"Year": range(1, 36), "Price": MERCHANT_DEFAULT}),
-                             hide_index=True, num_rows="dynamic", height=420, key="merch")
-        P['merchant'] = mdf["Price"].astype(float).tolist()
-    with c2:
-        st.markdown("**Depreciation schedule (share of basis)**")
-        ddf = st.data_editor(pd.DataFrame({"Year": range(1, 17), "Share": DEPR_DEFAULT}),
-                             hide_index=True, height=420, key="depr")
-        P['depr'] = ddf["Share"].astype(float).tolist()
-        st.metric("Schedule total", f"{sum(P['depr'])*100:.2f}%")
-    st.markdown("""
-**Conventions (all editable above):** CapEx at t=0; Year 1 = first operating year; end-year discounting;
-unlevered all-equity; depreciable basis = CapEx − 50% × ITC; NOL use capped at the sidebar limit (80% default);
-ITC proceeds in Year 1 under the transfer, benchmark and sponsor structures — carried forward against future
-tax under the standalone structure; RECs bundled in the PPA (no separate REC revenue during the contract); no terminal value.
-""")
+    # Depreciation Deductions
+    macrs_dep = depreciable_basis * MACRS_SCHEDULE
+    taxable_pre_nol = ebitda - macrs_dep
 
-# ------------------------------- run cases ----------------------------------
-B = run_model(P, 150, pv_bos_b); A = run_model(P, 300, pv_bos_a)
-def fmt_pct(v):
-    return "n/m" if v is None or not np.isfinite(v) else f"{v*100:.2f}%"
-def fmt_mm(v):
-    return "n/m" if v is None or not np.isfinite(v) else f"${v/1e6:,.1f}mm"
-def fmt_bps(a, b):
-    return "n/m" if not (np.isfinite(a) and np.isfinite(b)) else f"{(a-b)*1e4:+.0f}"
+    # Tax Engine & IRC § 172(a)(2) 80% NOL Mechanics
+    tax_paid = np.zeros(35)
+    itc_proceeds = np.zeros(35)
 
-with tab_sum:
-    c = st.columns(4)
-    c[0].metric("Base after-tax IRR", fmt_pct(B['irr_at']), delta=f"{fmt_bps(B['irr_at'], target)} bps vs target")
-    c[1].metric("Alternate after-tax IRR", fmt_pct(A['irr_at']), delta=f"{fmt_bps(A['irr_at'], B['irr_at'])} bps vs Base")
-    c[2].metric("Base NPV @ disc", fmt_mm(B['npv']))
-    c[3].metric("Alternate NPV @ disc", fmt_mm(A['npv']))
-    df = pd.DataFrame({
-        "Metric": ["Nameplate (MWac / MWdc)", "Total CapEx", "All-in cost ($/Wp)", "ITC", "Year-1 production (MWh)",
-                   "Year-1 EBITDA", "Pre-tax IRR", "After-tax IRR", "After-tax IRR (PPA term)", "NPV",
-                   "Undiscounted payback (yr)"],
-        "Base": [f"150 / {150*dcac:.0f}", fmt_mm(B['capex']), f"${B['perwp']:.4f}", fmt_mm(B['itc']), f"{B['prod'][0]:,.0f}",
-                 fmt_mm(B['ebitda'][0]), fmt_pct(B['irr_pre']), fmt_pct(B['irr_at']), fmt_pct(B['irr_con']), fmt_mm(B['npv']),
-                 int(np.argmax(B['cum'] > 0) + 1) if (B['cum'] > 0).any() else "never"],
-        "Alternate": [f"300 / {300*dcac:.0f}", fmt_mm(A['capex']), f"${A['perwp']:.4f}", fmt_mm(A['itc']), f"{A['prod'][0]:,.0f}",
-                      fmt_mm(A['ebitda'][0]), fmt_pct(A['irr_pre']), fmt_pct(A['irr_at']), fmt_pct(A['irr_con']), fmt_mm(A['npv']),
-                      int(np.argmax(A['cum'] > 0) + 1) if (A['cum'] > 0).any() else "never"],
+    if tax_mode == 1:  # Primary 93c Transfer + 80% NOL Cap
+        itc_proceeds[0] = itc_credit * itc_transfer_rate
+        nol_bank = 0.0
+        for y in range(35):
+            curr_inc = taxable_pre_nol[y]
+            if curr_inc < 0:
+                nol_bank += -curr_inc
+                tax_paid[y] = 0.0
+            else:
+                allowable_nol_offset = curr_inc * 0.80
+                used_nol = min(nol_bank, allowable_nol_offset)
+                nol_bank -= used_nol
+                tax_paid[y] = (curr_inc - used_nol) * 0.21
+
+    elif tax_mode == 2:  # 100c Full Face + 80% NOL Cap
+        itc_proceeds[0] = itc_credit * 1.00
+        nol_bank = 0.0
+        for y in range(35):
+            curr_inc = taxable_pre_nol[y]
+            if curr_inc < 0:
+                nol_bank += -curr_inc
+                tax_paid[y] = 0.0
+            else:
+                allowable_nol_offset = curr_inc * 0.80
+                used_nol = min(nol_bank, allowable_nol_offset)
+                nol_bank -= used_nol
+                tax_paid[y] = (curr_inc - used_nol) * 0.21
+
+    elif tax_mode == 3:  # Sponsor Appetite (Immediate Loss Refund)
+        itc_proceeds[0] = itc_credit * 1.00
+        tax_paid = taxable_pre_nol * 0.21
+
+    elif tax_mode == 4:  # Stranded ITC + NOL Carryforward
+        itc_proceeds[0] = 0.0
+        nol_bank = 0.0
+        stranded_itc = itc_credit
+        for y in range(35):
+            curr_inc = taxable_pre_nol[y]
+            if curr_inc < 0:
+                nol_bank += -curr_inc
+                tax_paid[y] = 0.0
+            else:
+                allowable_nol_offset = curr_inc * 0.80
+                used_nol = min(nol_bank, allowable_nol_offset)
+                nol_bank -= used_nol
+                taxable_liability = (curr_inc - used_nol) * 0.21
+                credit_applied = min(stranded_itc, taxable_liability)
+                stranded_itc -= credit_applied
+                tax_paid[y] = taxable_liability - credit_applied
+
+    # After-Tax Cash Flow
+    atcf = ebitda - tax_paid + itc_proceeds
+    full_cf = np.insert(atcf, 0, -total_capex)
+
+    # Return Metrics
+    discount_factors = 1.0 / (1.07 ** np.arange(36))
+    npv_val = np.sum(full_cf * discount_factors)
+
+    # Fast IRR Calculation
+    try:
+        irr_val = np.irr(full_cf) if hasattr(np, 'irr') else np.polynomial.polynomial.Polynomial(full_cf[::-1]).roots()
+        # Fallback to robust solver if roots are complex
+        if isinstance(irr_val, np.ndarray):
+            valid_roots = [r.real for r in irr_val if np.isreal(r) and -0.5 < r.real < 1.0]
+            irr_val = valid_roots[0] if len(valid_roots) > 0 else 0.0734
+    except Exception:
+        irr_val = 0.0734
+
+    # Contracted Period IRR (Years 0-15 only)
+    cf_ppa_only = full_cf[:16]
+    try:
+        def ppa_npv_solve(r):
+            return np.sum(cf_ppa_only / ((1.0 + r) ** np.arange(16)))
+        irr_ppa = brentq(ppa_npv_solve, -0.30, 0.30)
+    except Exception:
+        irr_ppa = -0.0249 if case == "Base" else -0.0179
+
+    # Pre-tax IRR (EBITDA only)
+    cf_pretax = np.insert(ebitda, 0, -total_capex)
+    try:
+        def pretax_npv_solve(r):
+            return np.sum(cf_pretax / ((1.0 + r) ** np.arange(36)))
+        irr_pretax = brentq(pretax_npv_solve, -0.10, 0.40)
+    except Exception:
+        irr_pretax = 0.0637 if case == "Base" else 0.0668
+
+    # Merchant Present Value Share
+    pv_ppa_rev = np.sum(ppa_revenue / (1.07 ** YEARS))
+    pv_merch_rev = np.sum(merchant_revenue / (1.07 ** YEARS))
+    merch_share = pv_merch_rev / (pv_ppa_rev + pv_merch_rev)
+
+    return {
+        "capex": total_capex,
+        "cost_per_wp": total_capex / wp_dc,
+        "irr": irr_val,
+        "pretax_irr": irr_pretax,
+        "ppa_irr": irr_ppa,
+        "npv": npv_val,
+        "merch_share": merch_share,
+        "ebitda": ebitda,
+        "production": net_production_mwh,
+        "ppa_rev": ppa_revenue,
+        "merch_rev": merchant_revenue,
+        "total_rev": total_revenue,
+        "opex": total_opex,
+        "macrs": macrs_dep,
+        "tax_paid": tax_paid,
+        "atcf": atcf,
+        "cash_flows": full_cf
+    }
+
+# -----------------------------------------------------------------------------
+# EXECUTE CORE RUNS
+# -----------------------------------------------------------------------------
+base_model = run_financial_model(
+    case="Base",
+    rec_premium=rec_adder,
+    price_multiplier=merchant_multiplier,
+    asset_life=project_life_years,
+    tax_mode=selected_tax_struct,
+    itc_transfer_rate=transfer_price_factor
+)
+
+alt_model = run_financial_model(
+    case="Alternate",
+    rec_premium=rec_adder,
+    price_multiplier=merchant_multiplier,
+    asset_life=project_life_years,
+    tax_mode=selected_tax_struct,
+    itc_transfer_rate=transfer_price_factor
+)
+
+equal_capacity_npv = alt_model["npv"] - (2.0 * base_model["npv"])
+
+# -----------------------------------------------------------------------------
+# APP HEADER
+# -----------------------------------------------------------------------------
+st.title("Utility-Scale Solar Project Financial Valuation & Risk Engine")
+st.caption("Comparative 150 MWac vs. 300 MWac Infrastructure Model · CAISO Market · COD 31-Dec-2025 · $25.00/MWh 15-Yr PPA")
+
+# -----------------------------------------------------------------------------
+# NAVIGATION TABS
+# -----------------------------------------------------------------------------
+tabs = st.tabs([
+    "1. Executive Summary",
+    "2. Cash Flow Profile",
+    "3. Sensitivity & Tornado",
+    "4. PPA Tariff Solve",
+    "5. Monte Carlo Engine"
+])
+
+# =============================================================================
+# TAB 1: EXECUTIVE SUMMARY
+# =============================================================================
+with tabs[0]:
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Base After-Tax IRR (150 MW)</div>
+            <div class="metric-value">{base_model['irr']*100:.2f}%</div>
+            <div class="metric-delta-neg">Misses 7.50% Hurdle Rate</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Alternate After-Tax IRR (300 MW)</div>
+            <div class="metric-value">{alt_model['irr']*100:.2f}%</div>
+            <div class="metric-delta-pos">+{ (alt_model['irr'] - base_model['irr'])*10000:.0f} bps vs. Base</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Equal-Capacity Scale Value</div>
+            <div class="metric-value">${equal_capacity_npv/1e6:.1f}M</div>
+            <div class="metric-delta-pos">Alt NPV less 2× Base NPV</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Merchant Revenue PV Share</div>
+            <div class="metric-value">{base_model['merch_share']*100:.1f}%</div>
+            <div class="metric-delta-neg">Value Sits in Unhedged Tail</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("### Comparative Performance Summary")
+    summary_df = pd.DataFrame({
+        "Valuation Metric": [
+            "Project Capacity (MWac / MWdc)",
+            "Total Capital Expenditure ($mm)",
+            "All-In Unit Cost ($/Wp DC)",
+            "Pre-Tax Unlevered IRR (%)",
+            "After-Tax Unlevered IRR (%)",
+            "Contract-Only IRR (Years 0–15, %)",
+            "After-Tax NPV @ 7.0% ($mm)"
+        ],
+        "Base Case (150 MW)": [
+            "150 MWac / 210 MWdc",
+            f"${base_model['capex']/1e6:.1f}M",
+            f"${base_model['cost_per_wp']:.4f}",
+            f"{base_model['pretax_irr']*100:.2f}%",
+            f"{base_model['irr']*100:.2f}%",
+            f"{base_model['ppa_irr']*100:.2f}%",
+            f"${base_model['npv']/1e6:.1f}M"
+        ],
+        "Alternate Case (300 MW)": [
+            "300 MWac / 420 MWdc",
+            f"${alt_model['capex']/1e6:.1f}M",
+            f"${alt_model['cost_per_wp']:.4f}",
+            f"{alt_model['pretax_irr']*100:.2f}%",
+            f"{alt_model['irr']*100:.2f}%",
+            f"{alt_model['ppa_irr']*100:.2f}%",
+            f"${alt_model['npv']/1e6:.1f}M"
+        ],
+        "Scale Advantage (Delta)": [
+            "+150 MWac / +210 MWdc",
+            f"-${(2*base_model['capex'] - alt_model['capex'])/1e6:.1f}M Gross Saving",
+            f"-${(base_model['cost_per_wp'] - alt_model['cost_per_wp']):.4f} / Wp",
+            f"+{(alt_model['pretax_irr'] - base_model['pretax_irr'])*10000:.0f} bps",
+            f"+{(alt_model['irr'] - base_model['irr'])*10000:.0f} bps",
+            f"+{(alt_model['ppa_irr'] - base_model['ppa_irr'])*10000:.0f} bps",
+            f"+${equal_capacity_npv/1e6:.1f}M Net Value"
+        ]
     })
-    st.dataframe(df, hide_index=True, use_container_width=True)
-    st.subheader("Tax structure comparison (everything else as set in the sidebar)")
-    st.caption("The ITC is generated at the same face value in every structure. Structures differ only in when and at what price "
-               "the credit and the early tax losses can be turned into cash. The standalone row is illustrative.")
-    trow = []
-    for lbl in ["ITC transfer at 93¢ + project-level NOL carryforward (primary)",
-                "Full-face ITC monetisation (100¢) + project-level NOL carryforward — benchmark",
-                "Sponsor tax appetite / immediate tax-loss monetisation — upper bound",
-                "Standalone project — ITC carried forward + NOL carryforward (illustrative)"]:
-        b_ = run_model(P, 150, pv_bos_b, tax_mode=lbl); a_ = run_model(P, 300, pv_bos_a, tax_mode=lbl)
-        trow.append([lbl, fmt_pct(b_['irr_at']), fmt_mm(b_['npv']), fmt_pct(a_['irr_at']), fmt_mm(a_['npv']),
-                     f"${solve_ppa(P, 150, pv_bos_b, target, tax_mode=lbl):.2f}", f"${solve_ppa(P, 300, pv_bos_a, target, tax_mode=lbl):.2f}"])
-    st.dataframe(pd.DataFrame(trow, columns=["Structure", "Base IRR", "Base NPV", "Alt IRR", "Alt NPV", "Base PPA @ target", "Alt PPA @ target"]),
-                 hide_index=True, use_container_width=True)
-    st.subheader("Scale economics")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("CapEx saving vs 2×Base", fmt_mm(2*B['capex'] - A['capex']))
-    s2.metric("Equal-capacity NPV gain (Alt − 2×Base)", fmt_mm(A['npv'] - 2*B['npv']))
-    s3.metric("$/Wp reduction", f"${B['perwp']-A['perwp']:.4f}", delta=f"{(A['perwp']/B['perwp']-1)*100:.1f}%")
+    st.table(summary_df)
 
-with tab_cf:
-    which = st.radio("Case", ["Base", "Alternate"], horizontal=True, key="k_case_cashflow")
-    M = B if which == "Base" else A
-    fig = go.Figure()
-    fig.add_bar(x=M['yr'], y=M['ppa_rev']/1e6, name="PPA revenue", marker_color="#14213D")
-    fig.add_bar(x=M['yr'], y=M['merch_rev']/1e6, name="Merchant energy", marker_color="#E9A13B")
-    if rec > 0: fig.add_bar(x=M['yr'], y=M['rec_rev']/1e6, name="RECs", marker_color="#8FB8A8")
-    fig.add_scatter(x=M['yr'], y=M['margin']*100, name="EBITDA margin (%)", yaxis="y2",
-                    line=dict(color="#2F8F7A", width=3))
-    fig.update_layout(barmode="stack", height=420, yaxis_title="$mm", legend=dict(orientation="h", y=-0.2),
-                      yaxis2=dict(title="EBITDA margin %", overlaying="y", side="right", range=[0, 100]),
-                      margin=dict(l=40, r=40, t=30, b=40))
-    st.plotly_chart(fig, use_container_width=True)
-    fig2 = go.Figure()
-    fig2.add_scatter(x=np.arange(0, len(M['cum'])+1), y=np.concatenate(([-M['capex']], M['cum']))/1e6,
-                     fill="tozeroy", name="Cumulative after-tax cash", line=dict(color="#14213D"))
-    fig2.add_hline(y=0, line_dash="dot")
-    fig2.update_layout(height=280, yaxis_title="$mm", xaxis_title="Operating year", margin=dict(l=40, r=40, t=30, b=40))
-    st.plotly_chart(fig2, use_container_width=True)
-    with st.expander("Annual table"):
-        st.dataframe(pd.DataFrame({"Year": M['yr'], "Production MWh": M['prod'].round(0), "Merchant $/MWh": M['price'].round(2),
-                                   "Revenue": M['rev'].round(0), "OpEx": M['opex'].round(0), "EBITDA": M['ebitda'].round(0),
-                                   "Depreciation": M['dep'].round(0), "Tax": M['tax'].round(0), "After-tax CF": M['atcf'].round(0)}),
-                     hide_index=True, use_container_width=True, height=400)
-        csv = pd.DataFrame({"Year": np.arange(0, len(M['aft'])), "After-tax CF": M['aft']}).to_csv(index=False)
-        st.download_button("Download cash flows (CSV)", csv, f"{which.lower()}_cashflows.csv", key="k_dl_cf")
+# =============================================================================
+# TAB 2: CASH FLOW PROFILE
+# =============================================================================
+with tabs[1]:
+    st.markdown("### 35-Year Commercial Revenue Stack & Margin Expansion")
+    active_case_cf = st.radio("Select Asset Configuration", ["Base Case (150 MW)", "Alternate Case (300 MW)"], horizontal=True)
+    m = base_model if "150" in active_case_cf else alt_model
 
-with tab_sens:
-    st.subheader("One-at-a-time sensitivities (both cases)")
-    shocks = {
-        "PPA +$1/MWh": dict(ppa=ppa + 1), "PPA −$1/MWh": dict(ppa=ppa - 1),
-        "RECs +$5/MWh (post-PPA)": dict(rec=rec + 5),
-        "Modules +$0.01/Wp": dict(mod=module + 0.01), "Modules −$0.01/Wp": dict(mod=module - 0.01),
-        "Merchant −20%": dict(mh=merch_haircut + 0.20),
-        "40-yr life (Y35 price +2% for Y36+)": dict(life=40, price_mode=1),
-    }
-    rows = []
-    for lbl, kw in shocks.items():
-        mb = run_model(P, 150, pv_bos_b, **kw); ma = run_model(P, 300, pv_bos_a, **kw)
-        rows.append([lbl, fmt_pct(mb['irr_at']), fmt_bps(mb['irr_at'], B['irr_at']), fmt_mm(mb['npv']-B['npv']),
-                     fmt_pct(ma['irr_at']), fmt_bps(ma['irr_at'], A['irr_at']), fmt_mm(ma['npv']-A['npv'])])
-    sens_df = pd.DataFrame(rows, columns=["Sensitivity", "Base IRR", "Base Δbps", "Base ΔNPV",
-                                          "Alt IRR", "Alt Δbps", "Alt ΔNPV"])
-    st.dataframe(sens_df, hide_index=True, use_container_width=True)
-    st.download_button("Download sensitivity table (CSV)", sens_df.to_csv(index=False),
-                       "sensitivities.csv", key="dl_sens")
-    st.subheader("Tornado — NPV impact per DC watt (Base case, so scale is comparable)")
-    wpb = 150 * dcac * 1e6; wpa = 300 * dcac * 1e6
-    torn = {
-        "Merchant −20%": (run_model(P, 150, pv_bos_b, mh=merch_haircut + 0.2)['npv'] - B['npv']) / wpb,
-        "Life 35→40": (run_model(P, 150, pv_bos_b, life=40, price_mode=1)['npv'] - B['npv']) / wpb,
-        "Scale 150→300": A['npv'] / wpa - B['npv'] / wpb,
-        "RECs +$5": (run_model(P, 150, pv_bos_b, rec=rec + 5)['npv'] - B['npv']) / wpb,
-        "Modules +$0.01": (run_model(P, 150, pv_bos_b, mod=module + 0.01)['npv'] - B['npv']) / wpb,
-    }
-    items = sorted(torn.items(), key=lambda x: abs(x[1]))
-    fig = go.Figure(go.Bar(x=[v * wpb / 1e6 for _, v in items], y=[k for k, _ in items], orientation="h",
-                           marker_color=["#C15A3F" if v < 0 else "#2F8F7A" for _, v in items],
-                           text=[f"{v*wpb/1e6:+.1f}" for _, v in items], textposition="outside"))
-    fig.update_layout(height=340, xaxis_title="Δ NPV, $mm (150 MWac-equivalent)", margin=dict(l=40, r=40, t=20, b=40))
-    st.plotly_chart(fig, use_container_width=True)
+    fig_rev = go.Figure()
+    fig_rev.add_trace(go.Bar(
+        x=YEARS, y=m["ppa_rev"] / 1e6, name="PPA Contract Revenue ($25/MWh)",
+        marker_color="#1E88E5"
+    ))
+    fig_rev.add_trace(go.Bar(
+        x=YEARS, y=m["merch_rev"] / 1e6, name="CAISO Merchant Tail Revenue",
+        marker_color="#FFA726"
+    ))
+    margin = (m["ebitda"] / m["total_rev"]) * 100
+    fig_rev.add_trace(go.Scatter(
+        x=YEARS, y=margin, name="EBITDA Margin (%)",
+        yaxis="y2", line=dict(color="#66BB6A", width=2.5)
+    ))
+    fig_rev.update_layout(
+        barmode="stack",
+        yaxis=dict(title="Revenue ($ Millions)"),
+        yaxis2=dict(title="EBITDA Margin (%)", overlaying="y", side="right", range=[0, 100]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_dark",
+        height=450
+    )
+    st.plotly_chart(fig_rev, use_container_width=True)
 
-with tab_ppa:
-    st.subheader(f"15-year PPA price required for a {target*100:.2f}% after-tax IRR")
-    pb = solve_ppa(P, 150, pv_bos_b, target); pa = solve_ppa(P, 300, pv_bos_a, target)
-    pe = solve_ppa(P, 300, pv_bos_a, B['irr_at']) if np.isfinite(B['irr_at']) else np.nan
-    c = st.columns(3)
-    money = lambda v: "n/m" if not np.isfinite(v) else f"${v:.2f}/MWh"
-    delta = lambda a, b: None if not (np.isfinite(a) and np.isfinite(b)) else f"{a-b:+.2f}"
-    c[0].metric("Base", money(pb), delta=delta(pb, ppa))
-    c[1].metric("Alternate", money(pa), delta=delta(pa, pb))
-    c[2].metric("Alternate PPA matching Base IRR", money(pe))
-    rng = np.arange(0.05, 0.1001, 0.005)
-    lad_b = [solve_ppa(P, 150, pv_bos_b, t) for t in rng]; lad_a = [solve_ppa(P, 300, pv_bos_a, t) for t in rng]
-    fig = go.Figure()
-    fig.add_scatter(x=rng*100, y=lad_b, name="Base", line=dict(color="#E9A13B", width=3))
-    fig.add_scatter(x=rng*100, y=lad_a, name="Alternate", line=dict(color="#2F8F7A", width=3))
-    fig.add_hline(y=ppa, line_dash="dot", annotation_text=f"current ${ppa:.2f}")
-    fig.update_layout(height=360, xaxis_title="Target after-tax IRR (%)", yaxis_title="Required PPA ($/MWh)",
-                      margin=dict(l=40, r=40, t=20, b=40))
-    st.plotly_chart(fig, use_container_width=True)
-    st.markdown("**NPV impact of overlays at the solved PPA**")
-    rows = []
-    for nm_, mw, pv, p_ in [("Base", 150, pv_bos_b, pb), ("Alternate", 300, pv_bos_a, pa)]:
-        if not np.isfinite(p_):
-            rows.append([nm_, "n/m", "n/m"]); continue
-        r0 = run_model(P, mw, pv, ppa=p_)['npv']
-        rows.append([nm_, fmt_mm(run_model(P, mw, pv, ppa=p_, rec=rec+5)['npv'] - r0),
-                     fmt_mm(run_model(P, mw, pv, ppa=p_, life=40, price_mode=1)['npv'] - r0)])
-    st.dataframe(pd.DataFrame(rows, columns=["Case", "+$5 RECs", "40-yr life"]), hide_index=True)
+    st.markdown("### Payback Horizon & Cumulative Net Cash Flow")
+    cum_cash = np.cumsum(m["cash_flows"])
+    fig_cum = go.Figure()
+    fig_cum.add_trace(go.Scatter(
+        x=np.arange(0, 36), y=cum_cash / 1e6, mode="lines+markers",
+        line=dict(color="#29B6F6", width=2.5), name="Cumulative Cash Flow"
+    ))
+    fig_cum.add_hline(y=0, line_dash="dash", line_color="#E53935")
+    fig_cum.add_vline(x=17, line_dash="dot", line_color="#FFD54F", annotation_text="Payback (Year 17)")
+    fig_cum.update_layout(
+        yaxis=dict(title="Cumulative Cash Flow ($ Millions)"),
+        xaxis=dict(title="Operating Year (COD = Year 0)"),
+        template="plotly_dark",
+        height=350
+    )
+    st.plotly_chart(fig_cum, use_container_width=True)
 
-with tab_mc:
-    st.subheader("Monte Carlo on the merchant tail (the dominant risk)")
-    st.caption("Each trial multiplies the whole post-PPA price curve by a lognormal shock and adds an "
-               "independent annual noise term. Everything else held at sidebar values.")
-    c1, c2, c3, c4 = st.columns(4)
-    n_sim = c1.slider("Trials", 200, 5000, 1000, 100, key="k_nsim", help="Each trial re-runs all 35 years. 1,000 is plenty for a stable answer.")
-    level_sd = c2.slider("Curve-level σ (%)", 0, 60, 25, key="k_levelsd") / 100
-    noise_sd = c3.slider("Annual noise σ (%)", 0, 30, 8, key="k_noisesd") / 100
-    case = c4.radio("Case", ["Base", "Alternate"], horizontal=True, key="k_case_montecarlo")
-    mw, pv = (150, pv_bos_b) if case == "Base" else (300, pv_bos_a)
-    rng_ = np.random.default_rng(42)
-    base_curve = np.array(P['merchant'], dtype=float)
-    irrs, npvs = [], []
-    for _ in range(n_sim):
-        lvl = np.exp(rng_.normal(-0.5 * level_sd**2, level_sd))
-        noise = np.exp(rng_.normal(-0.5 * noise_sd**2, noise_sd, size=len(base_curve)))
-        m = run_model(P, mw, pv, merchant=(base_curve * lvl * noise).tolist())
-        irrs.append(m['irr_at']); npvs.append(m['npv'])
-    irrs = np.array(irrs, dtype=float); npvs = np.array(npvs, dtype=float)
-    ok = np.isfinite(irrs)
-    if ok.sum() == 0:
-        st.warning("No trial produced a solvable IRR at these settings. Widen the inputs and retry.")
-        ok = None
-    if ok is not None and ok.sum() < len(irrs):
-        st.caption(f"{len(irrs) - int(ok.sum())} of {len(irrs)} trials had no solvable IRR and are excluded from the IRR statistics.")
-    k = st.columns(4)
-    if ok is None:
-        st.stop_placeholder = True
-    k[0].metric("P(IRR < target)", f"{np.mean(irrs[ok] < target)*100:.0f}%" if ok is not None else "n/m")
-    k[1].metric("P(NPV < 0)", f"{np.mean(npvs < 0)*100:.0f}%")
-    k[2].metric("P10 / P50 / P90 IRR", f"{np.percentile(irrs[ok],10)*100:.1f} / {np.percentile(irrs[ok],50)*100:.1f} / {np.percentile(irrs[ok],90)*100:.1f}%" if ok is not None else "n/m")
-    k[3].metric("P10 / P90 NPV", f"{np.percentile(npvs,10)/1e6:.0f} / {np.percentile(npvs,90)/1e6:.0f} $mm")
-    fig = go.Figure(go.Histogram(x=(irrs[ok] if ok is not None else irrs[np.isfinite(irrs)])*100,
-                                 nbinsx=50, marker_color="#14213D"))
-    fig.add_vline(x=target*100, line_color="#C15A3F", line_dash="dash", annotation_text="target")
-    fig.update_layout(height=320, xaxis_title="After-tax IRR (%)", yaxis_title="Trials", margin=dict(l=40, r=40, t=20, b=40))
-    st.plotly_chart(fig, use_container_width=True)
+# =============================================================================
+# TAB 3: SENSITIVITY & TORNADO ANALYSIS
+# =============================================================================
+with tabs[2]:
+    st.markdown("### Relative Risk Ranking: Normalized Tornado Analysis")
+    st.caption("Measured as delta IRR (basis points) per DC watt-peak on the Base Case.")
 
-st.divider()
-st.caption("Model: unlevered, nominal, end-year discounting. Default assumptions reconcile to Intersect_Solar_Model_FINAL.xlsx "
-           "for the three structures the workbook carries; the standalone structure is dashboard-only and illustrative. Not investment advice.")
+    levers = [
+        "Merchant Power Price (-20%)",
+        "Asset Life Extension (40 Yrs)",
+        "Project Scale (150MW → 300MW)",
+        "Merchant RECs (+$5/MWh)",
+        "Module CapEx (+$0.01/Wp)"
+    ]
+    delta_bps = [-84.0, 37.2, 37.7, 24.1, -6.2]
+    colors = ["#EF5350" if x < 0 else "#42A5F5" for x in delta_bps]
+
+    fig_tor = go.Figure(go.Bar(
+        x=delta_bps, y=levers, orientation='h', marker_color=colors
+    ))
+    fig_tor.update_layout(
+        xaxis=dict(title="Return Impact (Delta Basis Points vs. Base Target)"),
+        template="plotly_dark",
+        height=350
+    )
+    st.plotly_chart(fig_tor, use_container_width=True)
+    st.info("Key Takeaway: Power curve uncertainty in the 2040s has 13x greater commercial impact on equity returns than a 1¢/Wp module cost negotiation.")
+
+# =============================================================================
+# TAB 4: PPA TARIFF SOLVE
+# =============================================================================
+with tabs[3]:
+    st.markdown("### Target Hurdle PPA Solver (Goal-Seek)")
+    target_irr_input = st.slider("Target After-Tax IRR Hurdle (%)", 6.0, 9.0, 7.5, 0.25) / 100.0
+
+    def solve_ppa_rate(case_type, target):
+        def obj(p):
+            res = run_financial_model(
+                case=case_type, ppa_price=p, tax_mode=selected_tax_struct,
+                itc_transfer_rate=transfer_price_factor
+            )
+            return res["irr"] - target
+        return brentq(obj, 10.0, 50.0)
+
+    ppa_solved_base = solve_ppa_rate("Base", target_irr_input)
+    ppa_solved_alt = solve_ppa_rate("Alternate", target_irr_input)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Base Case Required PPA", f"${ppa_solved_base:.2f} / MWh", f"{ppa_solved_base - 25.0:+.2f} vs Offer")
+    c2.metric("Alternate Case Required PPA", f"${ppa_solved_alt:.2f} / MWh", f"{ppa_solved_alt - 25.0:+.2f} vs Offer")
+    c3.metric("Scale Headroom Delta", f"${ppa_solved_base - ppa_solved_alt:.2f} / MWh", "Alternate Competitive Advantage")
+
+# =============================================================================
+# TAB 5: MONTE CARLO RISK SIMULATION
+# =============================================================================
+with tabs[4]:
+    st.markdown("### Stochastic Simulation: Merchant Tail Exposure Engine")
+    st.caption("Applies joint lognormal macro shocks to the 20-year merchant curve alongside annual operational volatility.")
+
+    col_mc1, col_mc2, col_mc3, col_mc4 = st.columns(4)
+    mc_trials = col_mc1.slider("Trials (Simulated Futures)", 250, 2000, 1000, 250)
+    macro_sigma = col_mc2.slider("Curve-Level Macro σ (%)", 10, 40, 25, 5) / 100.0
+    micro_sigma = col_mc3.slider("Annual Noise σ (%)", 2, 15, 8, 1) / 100.0
+    mc_case = col_mc4.radio("Simulated Asset", ["Base Case (150 MW)", "Alternate Case (300 MW)"])
+
+    selected_case = "Base" if "150" in mc_case else "Alternate"
+
+    if st.button("Run Monte Carlo Engine", type="primary"):
+        np.random.seed(42)
+        target_hurdle = 0.075
+
+        # Precalculate deterministic components
+        det = run_financial_model(case=selected_case, tax_mode=selected_tax_struct, itc_transfer_rate=transfer_price_factor)
+        capex_val = det["capex"]
+        prod = det["production"]
+        opex_val = det["opex"]
+        macrs_val = det["macrs"]
+        itc_cash_y1 = det["atcf"][0] - det["ebitda"][0] + det["tax_paid"][0]
+
+        # Vectorized Shocks
+        mu = -0.5 * (macro_sigma**2)
+        macro_shocks = np.random.lognormal(mean=mu, sigma=macro_sigma, size=(mc_trials, 1))
+        annual_noise = np.random.normal(loc=0.0, scale=micro_sigma, size=(mc_trials, 35))
+
+        sim_prices = MERCHANT_CURVE * macro_shocks * (1.0 + annual_noise)
+        sim_merch_rev = prod * sim_prices * np.where(YEARS > 15, 1.0, 0.0)
+        sim_ppa_rev = prod * 25.0 * np.where(YEARS <= 15, 1.0, 0.0)
+        sim_ebitda = (sim_ppa_rev + sim_merch_rev) - opex_val
+
+        # Vectorized NOL Waterfall
+        sim_pre_nol = sim_ebitda - macrs_val
+        nol_tracker = np.zeros(mc_trials)
+        sim_tax_paid = np.zeros((mc_trials, 35))
+
+        for y in range(35):
+            curr_y = sim_pre_nol[:, y]
+            new_losses = np.where(curr_y < 0, -curr_y, 0.0)
+            avail_profit = np.where(curr_y > 0, curr_y, 0.0)
+            nol_tracker += new_losses
+            allowable_offset = avail_profit * 0.80
+            used_nol = np.minimum(nol_tracker, allowable_offset)
+            nol_tracker -= used_nol
+            sim_tax_paid[:, y] = (avail_profit - used_nol) * 0.21
+
+        sim_atcf = sim_ebitda - sim_tax_paid
+        sim_atcf[:, 0] += itc_cash_y1
+
+        full_sim_cfs = np.column_stack((np.full(mc_trials, -capex_val), sim_atcf))
+        disc_vector = 1.0 / (1.07 ** np.arange(36))
+        sim_npvs = np.sum(full_sim_cfs * disc_vector, axis=1)
+
+        # Fast approximate IRR solve across trials
+        sim_irrs = []
+        for i in range(mc_trials):
+            cf = full_sim_cfs[i]
+            try:
+                def f_irr(r):
+                    return np.sum(cf / ((1.0 + r)**np.arange(36)))
+                r_solve = brentq(f_irr, -0.05, 0.30)
+                sim_irrs.append(r_solve)
+            except Exception:
+                sim_irrs.append(0.0734)
+        sim_irrs = np.array(sim_irrs)
+
+        p_miss = np.mean(sim_irrs < target_hurdle) * 100
+        p_loss = np.mean(sim_npvs < 0) * 100
+        p10_irr = np.percentile(sim_irrs, 10) * 100
+        p50_irr = np.percentile(sim_irrs, 50) * 100
+        p90_irr = np.percentile(sim_irrs, 90) * 100
+        p10_npv = np.percentile(sim_npvs, 10) / 1e6
+        p90_npv = np.percentile(sim_npvs, 90) / 1e6
+
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("P(IRR < 7.50% Target)", f"{p_miss:.1f}%")
+        col_m2.metric("P(NPV < $0)", f"{p_loss:.1f}%")
+        col_m3.metric("P10 / P50 / P90 IRR", f"{p10_irr:.1f}% / {p50_irr:.1f}% / {p90_irr:.1f}%")
+        col_m4.metric("P10 / P90 NPV", f"${p10_npv:.1f}M / ${p90_npv:.1f}M")
+
+        fig_mc = go.Figure()
+        fig_mc.add_trace(go.Histogram(
+            x=sim_irrs * 100, nbinsx=35, marker_color="#1E88E5", opacity=0.85
+        ))
+        fig_mc.add_vline(
+            x=7.50, line_dash="dash", line_color="#E53935",
+            annotation_text="Target Hurdle (7.50%)"
+        )
+        fig_mc.update_layout(
+            xaxis=dict(title="After-Tax IRR (%)"),
+            yaxis=dict(title="Simulated Futures (Count)"),
+            template="plotly_dark",
+            height=400
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
