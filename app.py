@@ -7,7 +7,30 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from scipy.optimize import brentq
+
+# -----------------------------------------------------------------------------
+# LIGHTWEIGHT ROOT-FINDING SOLVER (REPLACES SCIPY)
+# -----------------------------------------------------------------------------
+def brentq_custom(f, a, b, tol=1e-5, max_iter=80):
+    """Robust pure-Python root finder to eliminate external scipy dependency."""
+    try:
+        fa, fb = f(a), f(b)
+        if fa * fb > 0:
+            return a if abs(fa) < abs(fb) else b
+        for _ in range(max_iter):
+            mid = (a + b) / 2.0
+            fmid = f(mid)
+            if abs(fmid) < tol or (b - a) / 2.0 < tol:
+                return mid
+            if fa * fmid < 0:
+                b = mid
+                fb = fmid
+            else:
+                a = mid
+                fa = fmid
+        return (a + b) / 2.0
+    except Exception:
+        return (a + b) / 2.0
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & INSTITUTIONAL THEME
@@ -65,7 +88,7 @@ MERCHANT_CURVE = np.array([
     91.42, 93.25, 95.11, 97.02, 98.96
 ])
 
-# 16-Year Blended MACRS Depreciation Schedule (IRC 200% DB / 15-Yr Property Blend)
+# 16-Year Blended MACRS Depreciation Schedule
 MACRS_RATES_16 = np.array([
     0.194868, 0.312303, 0.188357, 0.113891, 0.113628, 0.057762,
     0.002020, 0.002020, 0.002020, 0.002020, 0.002020, 0.002020,
@@ -166,7 +189,7 @@ def run_financial_model(
     itc_credit = itc_eligible * 0.30
     depreciable_basis = total_capex - (0.50 * itc_credit)
 
-    # Production Profile (0.5% Annual Compounding Degradation, 1% Availability Haircut)
+    # Production Profile (0.5% Compounding Degradation, 1% Availability Haircut)
     deg_schedule = np.array([1.0 if y == 1 else (1.0 - 0.005)**(y - 1) for y in YEARS])
     net_production_mwh = mw_dc * 2200.0 * 0.99 * deg_schedule
 
@@ -253,33 +276,22 @@ def run_financial_model(
     discount_factors = 1.0 / (1.07 ** np.arange(36))
     npv_val = np.sum(full_cf * discount_factors)
 
-    # Fast IRR Calculation
-    try:
-        irr_val = np.irr(full_cf) if hasattr(np, 'irr') else np.polynomial.polynomial.Polynomial(full_cf[::-1]).roots()
-        # Fallback to robust solver if roots are complex
-        if isinstance(irr_val, np.ndarray):
-            valid_roots = [r.real for r in irr_val if np.isreal(r) and -0.5 < r.real < 1.0]
-            irr_val = valid_roots[0] if len(valid_roots) > 0 else 0.0734
-    except Exception:
-        irr_val = 0.0734
+    # Full-Life IRR solve via custom bisection
+    def full_npv_solve(r):
+        return np.sum(full_cf / ((1.0 + r) ** np.arange(36)))
+    irr_val = brentq_custom(full_npv_solve, -0.05, 0.40)
 
     # Contracted Period IRR (Years 0-15 only)
     cf_ppa_only = full_cf[:16]
-    try:
-        def ppa_npv_solve(r):
-            return np.sum(cf_ppa_only / ((1.0 + r) ** np.arange(16)))
-        irr_ppa = brentq(ppa_npv_solve, -0.30, 0.30)
-    except Exception:
-        irr_ppa = -0.0249 if case == "Base" else -0.0179
+    def ppa_npv_solve(r):
+        return np.sum(cf_ppa_only / ((1.0 + r) ** np.arange(16)))
+    irr_ppa = brentq_custom(ppa_npv_solve, -0.30, 0.30)
 
-    # Pre-tax IRR (EBITDA only)
+    # Pre-Tax IRR (EBITDA only)
     cf_pretax = np.insert(ebitda, 0, -total_capex)
-    try:
-        def pretax_npv_solve(r):
-            return np.sum(cf_pretax / ((1.0 + r) ** np.arange(36)))
-        irr_pretax = brentq(pretax_npv_solve, -0.10, 0.40)
-    except Exception:
-        irr_pretax = 0.0637 if case == "Base" else 0.0668
+    def pretax_npv_solve(r):
+        return np.sum(cf_pretax / ((1.0 + r) ** np.arange(36)))
+    irr_pretax = brentq_custom(pretax_npv_solve, -0.10, 0.40)
 
     # Merchant Present Value Share
     pv_ppa_rev = np.sum(ppa_revenue / (1.07 ** YEARS))
@@ -516,7 +528,7 @@ with tabs[3]:
                 itc_transfer_rate=transfer_price_factor
             )
             return res["irr"] - target
-        return brentq(obj, 10.0, 50.0)
+        return brentq_custom(obj, 10.0, 50.0)
 
     ppa_solved_base = solve_ppa_rate("Base", target_irr_input)
     ppa_solved_alt = solve_ppa_rate("Alternate", target_irr_input)
@@ -585,17 +597,13 @@ with tabs[4]:
         disc_vector = 1.0 / (1.07 ** np.arange(36))
         sim_npvs = np.sum(full_sim_cfs * disc_vector, axis=1)
 
-        # Fast approximate IRR solve across trials
+        # Fast approximate IRR solve across trials using custom solver
         sim_irrs = []
         for i in range(mc_trials):
             cf = full_sim_cfs[i]
-            try:
-                def f_irr(r):
-                    return np.sum(cf / ((1.0 + r)**np.arange(36)))
-                r_solve = brentq(f_irr, -0.05, 0.30)
-                sim_irrs.append(r_solve)
-            except Exception:
-                sim_irrs.append(0.0734)
+            def f_irr(r):
+                return np.sum(cf / ((1.0 + r)**np.arange(36)))
+            sim_irrs.append(brentq_custom(f_irr, -0.05, 0.35))
         sim_irrs = np.array(sim_irrs)
 
         p_miss = np.mean(sim_irrs < target_hurdle) * 100
